@@ -2,12 +2,14 @@
 
 from contextlib import ExitStack
 from pathlib import Path
+from hashlib import sha256
 import json
 import logging
 
 import numpy as np
 
 from .contracts import BackendConfig, Candidate, GeometryConfig, RGBDFrame
+from .templates import ViewBank, save_cache
 from .depth_renderer import DepthRenderer
 from .geometry import candidate_has_depth_support, refine_depth_pose, touches_image_boundary
 
@@ -71,16 +73,29 @@ class SpatialHubBackend:
                 if session.get_providers()[0] != "CUDAExecutionProvider":
                     raise RuntimeError(f"{name} fell back to CPU; check CUDA/cuDNN installation")
                 session.disable_fallback()
-            logger.info("Building %d CAD templates; diameter %.4f m", config.template_views, self.diameter_m)
-            renderer = TemplateRenderer(model=mesh, model_unit="m", width=256, height=256,
-                                        max_chunk_size=16, ctx=self.estimator.glctx)
-            try:
-                self.detector = CNOS.from_cad_model(
-                    model=mesh, model_unit="m", descriptor=self.descriptor, segmentor=self.segmentor,
-                    renderer=renderer, num_viewpoints=config.template_views,
-                    radius=max(self.diameter_m * 2, 0.05), chunk_size=config.descriptor_batch_size)
-            finally:
-                renderer.release()
+            fingerprint = sha256(mesh_path.read_bytes() + mesh_unit.encode() + model_manifest.read_bytes()
+                                 + str(config.template_views).encode() + self.estimator.rot_grid.tobytes()).hexdigest()
+            path = cache_dir / "templates" / f"v1-{fingerprint}.npz"
+            if path.is_file():
+                with np.load(path, allow_pickle=False) as data:
+                    self.views = ViewBank(data["depth"], data["extent"])
+                    self.detector = CNOS(data["features"], self.descriptor, self.segmentor,
+                                         chunk_size=config.descriptor_batch_size)
+                logger.info("Loaded CAD templates from %s", path)
+            else:
+                logger.info("Building %d CAD templates; diameter %.4f m", config.template_views, self.diameter_m)
+                renderer = TemplateRenderer(model=mesh, model_unit="m", width=256, height=256,
+                                            max_chunk_size=16, ctx=self.estimator.glctx)
+                try:
+                    self.detector = CNOS.from_cad_model(
+                        model=mesh, model_unit="m", descriptor=self.descriptor, segmentor=self.segmentor,
+                        renderer=renderer, num_viewpoints=config.template_views,
+                        radius=max(self.diameter_m * 2, 0.05), chunk_size=config.descriptor_batch_size)
+                finally:
+                    renderer.release()
+                self.views = ViewBank.build(self.depth_renderer, self.estimator.rot_grid, self.diameter_m)
+                save_cache(path, features=self.detector.reference_features,
+                           depth=self.views.depth, extent=self.views.extent)
         except Exception:
             self._resources.close()
             raise
@@ -120,6 +135,25 @@ class SpatialHubBackend:
                 mask = full_mask
             candidates.append(Candidate(mask.astype(bool), float(score)))
         return candidates
+
+    def guided_poses(self, frame, candidates):
+        from .registration import register_steps
+
+        ranked = []
+        for index, candidate in enumerate(candidates[:self.config.max_candidates]):
+            match = self.views.match(frame, candidate.mask, self.diameter_m)
+            if match is not None:
+                score, orientations = match
+                ranked.append((score, index, orientations))
+        ranked.sort(key=lambda item: item[0])
+        # Lower-ranked masks may verify the silhouette, but promoting them to
+        # independent object seeds produced a false positive on recorded clutter.
+        for _, index, orientations in ranked:
+            mask = candidates[index].mask
+            steps = register_steps(self.estimator, frame, mask, self.config.register_iterations,
+                                   self.estimator.rot_grid[orientations])
+            pose = yield from steps
+            yield index, refine_depth_pose(frame, pose, self.render_depth, self.geometry, mask)
 
     def register(self, frame: RGBDFrame, mask: np.ndarray) -> np.ndarray:
         self.estimator.reset_tracking()

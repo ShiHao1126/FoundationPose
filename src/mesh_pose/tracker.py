@@ -26,6 +26,7 @@ class Tracker:
         self._K = None
         self._last_good_pose = None
         self._search_steps = None
+        self._retry_full = False
         self._strong_confirmation = False
 
     def _cancel_search(self) -> None:
@@ -114,6 +115,7 @@ class Tracker:
         quality = self._mask_quality(frame, pose, rendered, strong=True)
         if quality is not None:
             self._cancel_search()
+            self._retry_full = False
             self._pose = pose.copy()
             self._confirmed = 1
             self._tracked = 0
@@ -159,7 +161,7 @@ class Tracker:
         if self._frames_since_search < self.config.tracking.search_interval_frames:
             return "waiting_to_search", None
         self._frames_since_search = 0
-        self._search_steps = self._global_search(frame)
+        self._search_steps = self._global_search(frame, cooperative)
         return self._advance_search(cooperative)
 
     def _advance_search(self, cooperative):
@@ -172,26 +174,53 @@ class Tracker:
             self._search_steps = None
             return finished.value
 
-    def _global_search(self, frame: RGBDFrame):
+    def _global_search(self, frame: RGBDFrame, cooperative: bool):
         hypotheses = []
         last_quality = None
         candidates = self.backend.detect(frame)
-        for candidate in candidates[:self.config.backend.max_candidates]:
-            if candidate.similarity < self.config.backend.min_detection_similarity:
-                continue
-            mask = np.asarray(candidate.mask, dtype=bool)
-            if mask.shape != frame.depth_m.shape:
-                raise ValueError("Detector returned wrong mask shape")
-            if np.count_nonzero(mask & (frame.depth_m > 0)) < self.config.geometry.min_pixels:
-                continue
-            pose = yield from self.backend.register_steps(frame, mask)
-            quality = self._verify_registration_candidates(frame, pose, candidates)
-            logger.info("Registration: similarity=%.3f accepted=%s reason=%s inliers=%.3f mask_iou=%s",
-                        candidate.similarity, quality.accepted, quality.reason,
-                        quality.inlier_ratio, quality.mask_iou)
-            last_quality = quality
-            if quality.accepted:
-                hypotheses.append((quality.rank, pose.copy(), quality))
+        nominated = []
+        full_retry = self._retry_full
+        self._retry_full = False
+        attempted = False
+        proposals = () if full_retry else self.backend.guided_poses(frame, candidates)
+        for proposal in proposals:
+            if proposal is not None:
+                attempted = True
+                index, pose = proposal
+                if self._verify_registration_candidates(frame, pose, candidates).accepted:
+                    nominated.append(index)
+            yield
+        if attempted:
+            logger.info("Geometry shortlist selected seed indices %s", nominated)
+        if cooperative and attempted and not nominated:
+            # After a miss, spend the full-grid budget on the next live frame.
+            self._retry_full = True
+            self._frames_since_search = self.config.tracking.search_interval_frames
+            return "retry_full_on_fresh_frame", None
+        # A partial rotation grid can pass depth checks at the wrong orientation.
+        # Confirm shortlisted regions with the reference's full rotation grid.
+        fallback = [i for i in range(min(len(candidates), self.config.backend.max_candidates))
+                    if i not in nominated]
+        for indices in (nominated, fallback):
+            for index in indices:
+                candidate = candidates[index]
+                if candidate.similarity < self.config.backend.min_detection_similarity:
+                    continue
+                mask = np.asarray(candidate.mask, dtype=bool)
+                if mask.shape != frame.depth_m.shape:
+                    raise ValueError("Detector returned wrong mask shape")
+                if np.count_nonzero(mask & (frame.depth_m > 0)) < self.config.geometry.min_pixels:
+                    continue
+                pose = yield from self.backend.register_steps(frame, mask)
+                quality = self._verify_registration_candidates(frame, pose, candidates)
+                logger.info("Registration: similarity=%.3f accepted=%s reason=%s inliers=%.3f mask_iou=%s",
+                            candidate.similarity, quality.accepted, quality.reason,
+                            quality.inlier_ratio, quality.mask_iou)
+                last_quality = quality
+                if quality.accepted:
+                    hypotheses.append((quality.rank, pose.copy(), quality))
+            if hypotheses:
+                break
         if not hypotheses:
             self.backend.reset()
             return "no_verified_candidate", last_quality

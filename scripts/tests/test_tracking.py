@@ -54,6 +54,9 @@ class Backend:
         self.last_region = region
         return self.candidates
 
+    def guided_poses(self, frame, candidates):
+        return iter(())
+
     def register(self, frame, mask):
         self.register_calls += 1
         return self.registered_poses.pop(0) if self.registered_poses else self.next_pose.copy()
@@ -458,3 +461,40 @@ def test_invalid_pose_is_never_exported(config, bad):
     result = Tracker(backend, config).step(frame())
     assert result.T_camera_object is None and result.quality.reason == "invalid_pose"
 
+
+
+def test_guided_region_requires_full_grid_and_fresh_confirmation(config):
+    backend = Backend()
+    backend.guided_poses = lambda *_: iter([None, (0, pose())])
+    tracker = Tracker(backend, config)
+    seed = tracker.step(frame(0))
+    assert seed.state == "CONFIRMING" and seed.T_camera_object is None
+    assert tracker.step(frame(1)).state == "TRACKING"
+    assert backend.register_calls == 1
+
+
+def test_distinct_guided_instances_remain_ambiguous(config):
+    backend = Backend()
+    backend.candidates *= 2
+    backend.registered_poses = [pose(), pose(0.07)]
+    backend.guided_poses = lambda *_: iter([(0, pose()), (1, pose(0.07))])
+    result = Tracker(backend, config).step(frame())
+    assert result.reason == "ambiguous_instances" and result.T_camera_object is None
+
+
+def test_rejected_guided_pose_falls_back_to_full_grid(config):
+    backend = Backend()
+    backend.guided_poses = lambda *_: iter([(0, np.zeros((4, 4)))])
+    result = Tracker(backend, config).step(frame())
+    assert result.state == "CONFIRMING" and backend.register_calls == 1
+
+
+def test_live_shortlist_miss_runs_full_search_on_new_input(config):
+    backend = Backend()
+    backend.guided_poses = lambda *_: iter([(0, np.zeros((4, 4)))])
+    tracker = Tracker(backend, config)
+    assert tracker.step(frame(0), cooperative=True).reason == "global_search_in_progress"
+    assert tracker.step(frame(1), cooperative=True).reason == "retry_full_on_fresh_frame"
+    assert backend.register_calls == 0
+    assert tracker.step(frame(2), cooperative=True).state == "CONFIRMING"
+    assert backend.register_calls == 1

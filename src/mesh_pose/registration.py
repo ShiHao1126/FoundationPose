@@ -27,7 +27,7 @@ def relocalize_seed(estimator, frame, mask, seed, max_rotation_deg, iterations):
                                       estimator.model_diameter, iteration=max(1, iterations - 1))[0]
 
 
-def register_steps(estimator, frame, mask, iterations):
+def register_steps(estimator, frame, mask, iterations, grid=None):
     from spatialhub.models.foundationpose.adapter import make_crop_data_batch
     from spatialhub.models.foundationpose.helper import (
         egocentric_delta_pose_to_pose, guess_translation, rotvec_to_rotmat_np)
@@ -35,7 +35,7 @@ def register_steps(estimator, frame, mask, iterations):
 
     depth = estimator.depth_filter.apply(frame.depth_m, radius=2)
     xyz = unproject_depth_map(depth, estimator.K)
-    hypotheses = estimator.rot_grid.copy()
+    hypotheses = (estimator.rot_grid if grid is None else grid).copy()
     hypotheses[:, :3, 3] = guess_translation(depth=depth, mask=mask, K=estimator.K)
     refiner = estimator.refiner
     # Keep the original atlas dimensions and floating-point crop preparation.
