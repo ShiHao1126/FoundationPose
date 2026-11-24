@@ -530,3 +530,24 @@ def test_motion_retry_requires_current_depth_and_mask(config):
     assert tracker._motion_retry(frame(2), 1 / 30) is None
     backend.candidates = [Candidate(np.ones((40, 60), bool), .8)]
     assert tracker._motion_retry(frame(2, np.full((40, 60), .3, np.float32)), 1 / 30) is None
+
+
+def test_surface_relocation_preserves_cad_to_visible_surface_offset(config):
+    from mesh_pose.geometry import surface_center
+    image = frame()
+    seed = pose()
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    old = np.zeros_like(image.depth_m)
+    old[10:22, 17:29] = .47
+    mask = np.zeros_like(old, dtype=bool)
+    mask[10:22, 20:32] = True
+    candidate = Candidate(mask, .8)
+    backend.track = lambda _, guess: guess
+    backend.render_depth = lambda *_: np.where(mask, .5, 0).astype(np.float32)
+    fitted, quality = tracker._surface_relocation(image, seed, old, [candidate])
+    assert quality.accepted
+    assert fitted[2, 3] == pytest.approx(.53, abs=1e-6)
+    assert surface_center(old, mask & (old == 0), image.K, 100) is None
+    assert tracker._surface_relocation(frame(depth=np.full(old.shape, .2, np.float32)),
+                                       seed, old, [candidate]) is None

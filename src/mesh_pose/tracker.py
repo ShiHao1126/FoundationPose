@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from .contracts import Candidate, Config, PoseBackend, Quality, RGBDFrame, TrackingResult
-from .geometry import is_rigid_pose, pose_difference, touches_image_boundary, verify_depth
+from .geometry import is_rigid_pose, pose_difference, surface_center, touches_image_boundary, verify_depth
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,41 @@ class Tracker:
         self._strong_confirmation = True
         self.state = "CONFIRMING"
 
+    def _surface_relocation(self, frame, seed, rendered, candidates):
+        # Align *visible surfaces*: their offsets from the mesh origin generally
+        # do not vanish. Use the shift only as an initializer on this RGB-D frame.
+        minimum = self.config.geometry.min_pixels
+        reference = surface_center(rendered, rendered > 0, frame.K, minimum)
+        if reference is None:
+            return None
+        matches = []
+        for c in candidates[:self.config.backend.max_candidates]:
+            if c.similarity < self.config.backend.min_detection_similarity:
+                continue
+            observed = surface_center(frame.depth_m, c.mask, frame.K, minimum)
+            if observed is None:
+                continue
+            shift = observed - reference
+            if np.linalg.norm(shift) > self.config.tracking.max_translation_step_m:
+                continue
+            guess = seed.copy()
+            guess[:3, 3] += shift
+            pose = self.backend.track(frame, guess)
+            if not is_rigid_pose(pose):
+                continue
+            distance, angle = pose_difference(seed, pose)
+            if distance > self.config.tracking.max_translation_step_m or angle > self.config.tracking.max_rotation_step_deg:
+                continue
+            quality = self._registration_quality(frame, pose, c.mask)
+            if quality.accepted:
+                matches.append((pose, quality))
+        if not matches:
+            return None
+        best, quality = max(matches, key=lambda pair: pair[1].rank)
+        if any(pose_difference(best, other)[0] > self.backend.diameter_m * .35 for other, _ in matches):
+            return None
+        return best, quality
+
     def _refresh_initialization(self, frame: RGBDFrame, seed: np.ndarray,
                                 candidates: list[Candidate] | None = None) -> tuple[np.ndarray, Quality] | None:
         """A globally verified but old seed may need more than small-step tracking."""
@@ -141,6 +176,10 @@ class Tracker:
         # to click. Final pose, motion and strong mask/depth gates remain mandatory.
         candidates = sorted(candidates, key=lambda c: np.count_nonzero(c.mask & silhouette)
                         / max(np.count_nonzero(c.mask | silhouette), 1), reverse=True)
+        relocation = self._surface_relocation(frame, seed, rendered, candidates)
+        if relocation is not None:
+            logger.info("Surface-aligned seed verified on frame %d", frame.sequence)
+            return relocation
         for candidate in candidates[:self.config.backend.max_candidates]:
             if candidate.similarity < self.config.backend.min_detection_similarity:
                 continue
@@ -325,7 +364,7 @@ class Tracker:
                 pose = self.backend.track(frame, self._pose.copy())
                 quality = self._quality(frame, pose)
                 reason = quality.reason
-                if was_tracking and reason in {"depth_mismatch", "free_space_conflict"}:
+                if was_tracking and reason in {"depth_mismatch", "free_space_conflict", "insufficient_visibility"}:
                     retried = self._motion_retry(frame, previous_time)
                     if retried is not None:
                         pose, quality = retried

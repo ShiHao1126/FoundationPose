@@ -44,6 +44,16 @@ def pose_difference(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return distance, angle
 
 
+def surface_center(depth: np.ndarray, mask: np.ndarray, K: np.ndarray, min_pixels: int):
+    """Median visible surface in camera coordinates (metres), not the CAD origin."""
+    y, x = np.nonzero(mask & (depth > 0))
+    if len(x) < min_pixels:
+        return None
+    z = depth[y, x]
+    return np.array([np.median((x - K[0, 2]) * z / K[0, 0]),
+                     np.median((y - K[1, 2]) * z / K[1, 1]), np.median(z)])
+
+
 def refine_depth_pose(frame: RGBDFrame, initial_pose: np.ndarray,
                       render: Callable[[RGBDFrame, np.ndarray], np.ndarray],
                       config: GeometryConfig, mask: np.ndarray | None = None) -> np.ndarray:

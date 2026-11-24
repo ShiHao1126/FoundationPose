@@ -10,6 +10,11 @@ import numpy as np
 from PIL import Image, ImageTk
 
 
+def preview_lut(gamma: float) -> np.ndarray:
+    """Display transfer with fixed black/white points; gamma=1 shows the raw RGB."""
+    return np.rint(255 * (np.arange(256) / 255) ** (1 / gamma)).astype(np.uint8)
+
+
 def annotate_pose(rgb, K, pose, bounds):
     canvas = rgb.copy()
     if pose is None:
@@ -101,6 +106,15 @@ class LiveViewer:
         self.badge.pack(side="left", padx=14)
         tk.Button(header, text="停止   Esc", command=session.request_stop, relief="flat",
                   bg="#344556", fg="white", padx=12).pack(side="right")
+        tone = tk.Frame(header, bg="#111923")
+        tone.pack(side="right", padx=20)
+        tk.Label(tone, text="预览亮度", bg="#111923", fg="#d0dce8",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        self.preview_gamma = tk.DoubleVar(value=1.7)
+        tk.Scale(tone, from_=1.0, to=2.5, resolution=.1, variable=self.preview_gamma,
+                 orient="horizontal", length=120, showvalue=False, highlightthickness=0,
+                 bg="#111923", troughcolor="#344556", bd=0).pack(side="left", padx=8)
+        self._gamma = None
         self.picture = tk.Label(self.root, bg="#111923", borderwidth=0)
         self.picture.pack(fill="x")
         footer = tk.Frame(self.root, bg="#1c2937")
@@ -132,9 +146,13 @@ class LiveViewer:
         status = live_status(snapshot, now, self.max_pose_age_s, self.session.stop.is_set())
         frame, estimate = snapshot["frame"], snapshot["estimate"]
         if frame is not None:
-            left = frame.frame.rgb
+            gamma = self.preview_gamma.get()
+            if gamma != self._gamma:
+                self._display_lut = preview_lut(gamma)
+                self._gamma = gamma
+            left = cv2.LUT(frame.frame.rgb, self._display_lut)
             if estimate is not None:
-                right = annotate_pose(estimate.source.frame.rgb, estimate.source.frame.K,
+                right = annotate_pose(cv2.LUT(estimate.source.frame.rgb, self._display_lut), estimate.source.frame.K,
                                       estimate.result.T_camera_object if status["valid_now"] else None,
                                       snapshot["bounds"])
             else:
