@@ -29,7 +29,8 @@ class PoseMatcher:
             rendered = self.backend.render_depth(frame, pose)
         return verify_depth(frame.depth_m, rendered, self.config.geometry, mask)
 
-    def registration_quality(self, frame: RGBDFrame, pose: np.ndarray, mask, rendered=None) -> Quality:
+    def registration_quality(self, frame: RGBDFrame, pose: np.ndarray, mask, rendered=None,
+                             *, global_search=False) -> Quality:
         if rendered is None and is_rigid_pose(pose):
             rendered = self.backend.render_depth(frame, pose)
         quality = self.quality(frame, pose, mask, rendered)
@@ -40,6 +41,9 @@ class PoseMatcher:
             or quality.mask_iou < self.config.geometry.min_registration_mask_iou
         ):
             return replace(quality, accepted=False, reason="weak_registration_geometry")
+        if (global_search and quality.accepted
+                and quality.full_mask_support < self.config.geometry.min_registration_mask_iou):
+            return replace(quality, accepted=False, reason="insufficient_global_mask_support")
         return quality
 
     def mask_quality(self, frame, pose, rendered, *, strong):
@@ -74,13 +78,14 @@ class PoseMatcher:
         return accepted
 
     def verify_registration_candidates(self, frame: RGBDFrame, pose: np.ndarray,
-                                         candidates: list[Candidate], rendered=None) -> Quality:
+                                         candidates: list[Candidate], rendered=None, *, global_search=False) -> Quality:
         """The seed mask proposes a pose; any qualified full silhouette can verify it."""
         if not is_rigid_pose(pose):
             return Quality(False, "invalid_pose")
         if rendered is None:
             rendered = self.backend.render_depth(frame, pose)
-        qualities = [self.registration_quality(frame, pose, c.mask, rendered) for c in candidates
+        qualities = [self.registration_quality(frame, pose, c.mask, rendered, global_search=global_search)
+                     for c in candidates
                      if c.similarity >= self.config.backend.min_detection_similarity]
         return max(qualities, key=lambda q: (q.accepted, q.rank),
                    default=Quality(False, "no_detection"))
@@ -204,14 +209,19 @@ class PoseMatcher:
         last_quality = None
         nominated = []
         attempted = False
-        proposals = () if full_retry else self.backend.guided_poses(frame, candidates)
-        for proposal in proposals:
-            if proposal is not None:
-                attempted = True
-                index, pose = proposal
-                if self.verify_registration_candidates(frame, pose, candidates).accepted:
-                    nominated.append(index)
-            yield
+        limit = self.config.backend.max_candidates
+        if not full_retry:
+            for geometry_rescue in (False, True):
+                if geometry_rescue and (nominated or len(candidates) <= limit):
+                    break
+                for proposal in self.backend.guided_poses(frame, candidates, geometry_rescue):
+                    if proposal is not None:
+                        attempted = True
+                        index, pose = proposal
+                        masks = [candidates[index]] if geometry_rescue else candidates
+                        if self.verify_registration_candidates(frame, pose, masks, global_search=True).accepted:
+                            nominated.append(index)
+                    yield
         if attempted:
             logger.info("Geometry shortlist selected seed indices %s", nominated)
         if cooperative and attempted and not nominated:
@@ -232,13 +242,20 @@ class PoseMatcher:
                 if np.count_nonzero(mask & (frame.depth_m > 0)) < self.config.geometry.min_pixels:
                     continue
                 pose = yield from self.backend.register_steps(frame, mask)
-                quality = self.verify_registration_candidates(frame, pose, candidates)
+                # A promoted seed must explain its own observed silhouette on
+                # both passes; another instance cannot supply its evidence.
+                masks = [candidate] if index >= limit else candidates
+                quality = self.verify_registration_candidates(frame, pose, masks, global_search=True)
                 logger.info("Registration: similarity=%.3f accepted=%s reason=%s inliers=%.3f mask_iou=%s",
                             candidate.similarity, quality.accepted, quality.reason,
                             quality.inlier_ratio, quality.mask_iou)
                 last_quality = quality
                 if quality.accepted:
                     hypotheses.append((pose.copy(), quality))
+                elif cooperative and index >= limit:
+                    # The extra region is tried only after the appearance shortlist
+                    # misses. Keep the usual fresh-frame fallback if it fails.
+                    return "retry_full_on_fresh_frame", quality, None
             if hypotheses:
                 break
         if not hypotheses:

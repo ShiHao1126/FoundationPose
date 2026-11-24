@@ -120,6 +120,7 @@ class Quality:
     free_space_ratio: float = 1.0
     median_error_m: float | None = None
     mask_iou: float | None = None
+    full_mask_support: float | None = None  # Non-occluded overlap / complete mask-silhouette union.
 
     @property
     def rank(self) -> float:
@@ -152,7 +153,7 @@ class PoseBackend(Protocol):
     diameter_m: float
 
     def detect(self, frame: RGBDFrame, *, region: tuple[int, int, int, int] | None = None) -> list[Candidate]: ...
-    def guided_poses(self, frame: RGBDFrame, candidates: list[Candidate]) -> Generator[tuple[int, np.ndarray] | None, None, None]: ...
+    def guided_poses(self, frame: RGBDFrame, candidates: list[Candidate], geometry_rescue: bool = False) -> Generator[tuple[int, np.ndarray] | None, None, None]: ...
     def register(self, frame: RGBDFrame, mask: np.ndarray) -> np.ndarray: ...
     def register_steps(self, frame: RGBDFrame, mask: np.ndarray) -> Generator[None, None, np.ndarray]: ...
     def relocalize_seed(self, frame: RGBDFrame, mask: np.ndarray, seed: np.ndarray,

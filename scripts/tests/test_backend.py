@@ -55,3 +55,24 @@ def test_global_detector_keeps_masks_beyond_registration_budget(monkeypatch):
     frame = RGBDFrame(1, 1., np.zeros((40, 60, 3), np.uint8), np.ones((40, 60), np.float32),
                       np.array([[100, 0, 30], [0, 100, 20], [0, 0, 1]], np.float32))
     assert config.backend.max_candidates == 3 and len(b.detect(frame)) == 7
+
+
+def test_geometry_rescue_proposes_only_the_overall_winner_outside_the_budget(monkeypatch):
+    from mesh_pose.contracts import Candidate
+
+    b = SpatialHubBackend.__new__(SpatialHubBackend)
+    b.config = SimpleNamespace(max_candidates=3, register_iterations=5)
+    b.estimator = SimpleNamespace(rot_grid=np.eye(4)[None])
+    b.diameter_m, b.geometry = .1, None
+    masks = [np.eye(5, dtype=bool)[i:i+1] for i in range(5)]
+    costs = [4., 3., 2., 1., .5]
+    b.views = SimpleNamespace(match=lambda frame, mask, diameter: (costs[mask.argmax()], [0]))
+    def register(*args):
+        yield from ()
+        return np.eye(4)
+    monkeypatch.setattr("mesh_pose.registration.register_steps", register)
+    monkeypatch.setattr("mesh_pose.backend.refine_depth_pose", lambda frame, pose, *args: pose)
+    candidates = [Candidate(m, .8) for m in masks]
+    assert [i for i, _ in b.guided_poses(None, candidates, True)] == [4]
+    costs[1] = .1
+    assert list(b.guided_poses(None, candidates, True)) == []

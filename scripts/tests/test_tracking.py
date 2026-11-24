@@ -54,7 +54,7 @@ class Backend:
         self.last_region = region
         return self.candidates
 
-    def guided_poses(self, frame, candidates):
+    def guided_poses(self, frame, candidates, geometry_rescue=False):
         return iter(())
 
     def register(self, frame, mask):
@@ -452,6 +452,22 @@ def test_depth_verifier_accepts_partial_occlusion_but_not_complete_occlusion(con
     assert not quality.accepted and quality.reason == "insufficient_visibility"
 
 
+def test_global_identity_needs_full_silhouette_support_while_local_fit_can_use_visible_part(config):
+    image = frame()
+    backend = Backend()
+    rendered = backend.render_depth(image, pose())
+    visible = rendered > 0
+    visible[:, :32] = False
+    image.depth_m[(rendered > 0) & ~visible] = .25
+    matcher = Tracker(backend, config).matcher
+    candidates = [Candidate(visible, .8)]
+    local = matcher.verify_registration_candidates(image, pose(), candidates)
+    scene = matcher.verify_registration_candidates(image, pose(), candidates, global_search=True)
+    assert local.accepted and local.mask_iou == 1.
+    assert 0.4 < scene.full_mask_support < 0.5
+    assert not scene.accepted and scene.reason == "insufficient_global_mask_support"
+
+
 def test_depth_holes_cannot_count_as_inliers(config):
     rendered = np.full((40, 60), 0.5, np.float32)
     observed = rendered.copy()
@@ -503,12 +519,49 @@ def test_invalid_pose_is_never_exported(config, bad):
 
 def test_guided_region_requires_full_grid_and_fresh_confirmation(config):
     backend = Backend()
-    backend.guided_poses = lambda *_: iter([None, (0, pose())])
+    backend.candidates *= 4
+    def guided(frame, candidates, geometry_rescue):
+        assert not geometry_rescue  # An appearance nomination already explains this observation.
+        yield None
+        yield 0, pose()
+    backend.guided_poses = guided
     tracker = Tracker(backend, config)
     seed = tracker.step(frame(0))
     assert seed.state == "CONFIRMING" and seed.T_camera_object is None
     assert tracker.step(frame(1)).state == "TRACKING"
     assert backend.register_calls == 1
+
+
+@pytest.mark.parametrize("own_silhouette, valid_full", [(True, True), (False, True), (True, False)])
+def test_geometry_rescue_needs_its_own_mask_and_a_new_frame(config, own_silhouette, valid_full):
+    backend = Backend()
+    image = frame()
+    mask = rendered_object(image.depth_m.shape) > 0
+    part = mask.copy()
+    part[:, 8:] = False
+    backend.candidates = [Candidate(mask.copy(), .8) for _ in range(3)]
+    backend.candidates.append(Candidate(mask.copy() if own_silhouette else part, .7))
+    stages = []
+    def guided(frame, candidates, geometry_rescue):
+        stages.append(geometry_rescue)
+        yield (3, pose()) if geometry_rescue else (0, np.zeros((4, 4)))
+    backend.guided_poses = guided
+    if not valid_full:
+        backend.registered_poses = [np.zeros((4, 4))]
+    tracker = Tracker(backend, config)
+    result = tracker.step(image, cooperative=True)
+    i = 0
+    while result.reason == "global_search_in_progress":
+        i += 1
+        result = tracker.step(frame(i), cooperative=True)
+    assert stages == [False, True]
+    assert result.T_camera_object is None
+    if own_silhouette and valid_full:
+        assert backend.register_calls == 1 and result.state == "CONFIRMING"
+        assert tracker.step(frame(i + 1), cooperative=True).state == "TRACKING"
+    else:
+        assert backend.register_calls == int(own_silhouette)
+        assert result.reason == "retry_full_on_fresh_frame"
 
 
 def test_distinct_guided_instances_remain_ambiguous(config):

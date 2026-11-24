@@ -136,18 +136,23 @@ class SpatialHubBackend:
             candidates.append(Candidate(mask.astype(bool), float(score)))
         return candidates
 
-    def guided_poses(self, frame, candidates):
+    def guided_poses(self, frame, candidates, geometry_rescue=False):
         from .registration import register_steps
 
         ranked = []
-        for index, candidate in enumerate(candidates[:self.config.max_candidates]):
+        limit = self.config.max_candidates
+        pool = candidates if geometry_rescue else candidates[:limit]
+        for index, candidate in enumerate(pool):
             match = self.views.match(frame, candidate.mask, self.diameter_m)
             if match is not None:
                 score, orientations = match
                 ranked.append((score, index, orientations))
         ranked.sort(key=lambda item: item[0])
-        # Lower-ranked masks may verify the silhouette, but promoting them to
-        # independent object seeds produced a false positive on recorded clutter.
+        if geometry_rescue:
+            # Only the overall geometry winner can expand the appearance budget.
+            if not ranked or ranked[0][1] < limit:
+                return
+            ranked = ranked[:1]
         for _, index, orientations in ranked:
             mask = candidates[index].mask
             steps = register_steps(self.estimator, frame, mask, self.config.register_iterations,

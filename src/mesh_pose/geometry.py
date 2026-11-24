@@ -155,13 +155,17 @@ def verify_depth(observed: np.ndarray, rendered: np.ndarray, config: GeometryCon
     free_space = np.count_nonzero(residual > config.depth_tolerance_m) / max(count, 1)
     error = float(np.median(absolute)) if count else None
     iou = None
+    full_mask_support = None
     if mask is not None:
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != observed.shape:
             raise ValueError("Candidate mask dimensions do not match RGB-D")
-        intersection = np.count_nonzero(mask[silhouette] & ~occluded)
-        union = np.count_nonzero(mask) + pixels - np.count_nonzero(occluded) - intersection
+        projected_mask = mask[silhouette]
+        intersection = np.count_nonzero(projected_mask & ~occluded)
+        total = np.count_nonzero(mask) + pixels
+        union = total - np.count_nonzero(occluded) - intersection
         iou = intersection / max(union, 1)
+        full_mask_support = intersection / (total - np.count_nonzero(projected_mask))
     reason = "ok"
     for failed, label in (
         (coverage < config.min_depth_coverage, "insufficient_depth"),
@@ -173,5 +177,6 @@ def verify_depth(observed: np.ndarray, rendered: np.ndarray, config: GeometryCon
         if failed:
             reason = label
             break
-    return Quality(reason == "ok", reason, pixels, coverage, fraction, inlier, free_space, error, iou)
+    return Quality(reason == "ok", reason, pixels, coverage, fraction, inlier, free_space, error, iou,
+                   full_mask_support)
 
