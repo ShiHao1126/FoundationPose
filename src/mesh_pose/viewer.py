@@ -14,10 +14,6 @@ def annotate_pose(rgb, K, pose, bounds):
     canvas = rgb.copy()
     if pose is None:
         return canvas
-    rvec, _ = cv2.Rodrigues(pose[:3, :3])
-    # Canvas is RGB, so x is blue here unless drawing in BGR first.
-    bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
-    cv2.drawFrameAxes(bgr, K, np.zeros(5), rvec, pose[:3, 3], 0.03, 2)
     if bounds is not None:
         corners = np.array(list(itertools.product(*zip(bounds[0], bounds[1]))))
         xyz = corners @ pose[:3, :3].T + pose[:3, 3]
@@ -28,8 +24,28 @@ def annotate_pose(rgb, K, pose, bounds):
                 for bit in (1, 2, 4):
                     j = i ^ bit
                     if i < j:
-                        cv2.line(bgr, tuple(uv[i]), tuple(uv[j]), (50, 230, 60), 2, cv2.LINE_AA)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        cv2.line(canvas, tuple(uv[i]), tuple(uv[j]), (95, 211, 204), 1, cv2.LINE_AA)
+    length = .045 if bounds is None else .65 * np.max(np.ptp(bounds, axis=0))
+    points = np.vstack([np.zeros(3), np.eye(3) * length]) @ pose[:3, :3].T + pose[:3, 3]
+    if np.all(points[:, 2] > 0):
+        uv = points @ K.T
+        uv = np.rint(uv[:, :2] / uv[:, 2:]).astype(int)
+        _axes(canvas, uv[0], uv[1:])
+    origin = np.array([48, canvas.shape[0] - 48])
+    cv2.circle(canvas, tuple(origin), 42, (22, 31, 42), -1, cv2.LINE_AA)
+    _axes(canvas, origin, origin + np.rint(29 * pose[:2, :3].T).astype(int))
+    return canvas
+
+
+def _axes(image, origin, ends):
+    for axis, end, color in zip("XYZ", ends, [(255, 91, 97), (106, 235, 131), (80, 163, 255)]):
+        cv2.line(image, tuple(origin), tuple(end), (18, 23, 30), 5, cv2.LINE_AA)
+        cv2.arrowedLine(image, tuple(origin), tuple(end), color, 2, cv2.LINE_AA, tipLength=.22)
+        pos = (int(np.clip(end[0] + 3, 2, image.shape[1] - 16)),
+               int(np.clip(end[1] - 3, 16, image.shape[0] - 4)))
+        for ink, width in [((13, 19, 27), 4), (color, 1)]:
+            cv2.putText(image, axis, pos, cv2.FONT_HERSHEY_DUPLEX, .55, ink, width, cv2.LINE_AA)
+    cv2.circle(image, tuple(origin), 3, (248, 250, 252), -1, cv2.LINE_AA)
 
 
 def live_status(snapshot, now: float, max_pose_age_s: float, stopping: bool) -> dict:
@@ -76,14 +92,32 @@ class LiveViewer:
         self._video_frames = 0
         self._display_log = None
         self._photos = []
-        tk.Label(self.root, text="实时相机（左）  |  位姿对应帧（右，有推理延迟）", font=("Microsoft YaHei UI", 13)).pack()
-        self.picture = tk.Label(self.root)
-        self.picture.pack()
-        self.status = tk.Label(self.root, justify="left", anchor="w", font=("Consolas", 12))
-        self.status.pack(fill="x", padx=10)
-        tk.Label(self.root, text="位置：原始 mesh 原点，相机坐标 x 右 / y 下 / z 前；轴：红 X、绿 Y、蓝 Z。过期位姿自动隐藏。",
-                 font=("Microsoft YaHei UI", 10)).pack()
-        tk.Button(self.root, text="停止并释放相机（Esc）", command=session.request_stop).pack(pady=5)
+        self.root.configure(bg="#111923")
+        header = tk.Frame(self.root, bg="#111923")
+        header.pack(fill="x", padx=18, pady=10)
+        tk.Label(header, text="物体位姿跟踪", bg="#111923", fg="#eff4fa",
+                 font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
+        self.badge = tk.Label(header, padx=12, pady=3, font=("Microsoft YaHei UI", 10, "bold"))
+        self.badge.pack(side="left", padx=14)
+        tk.Button(header, text="停止   Esc", command=session.request_stop, relief="flat",
+                  bg="#344556", fg="white", padx=12).pack(side="right")
+        self.picture = tk.Label(self.root, bg="#111923", borderwidth=0)
+        self.picture.pack(fill="x")
+        footer = tk.Frame(self.root, bg="#1c2937")
+        footer.pack(fill="x")
+        self.xyz = []
+        for axis, color in zip("XYZ", ("#ff8990", "#86df9c", "#80b6ff")):
+            card = tk.Frame(footer, bg="#1c2937")
+            card.pack(side="left", padx=18, pady=9)
+            tk.Label(card, text=f"{axis}   /   mm", bg="#1c2937", fg=color,
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            value = tk.Label(card, width=8, anchor="w", bg="#1c2937", fg="white", font=("Consolas", 16))
+            value.pack()
+            self.xyz.append(value)
+        self.status = tk.Label(footer, bg="#1c2937", justify="right", font=("Microsoft YaHei UI", 10))
+        self.status.pack(side="right", padx=16)
+        self.rotation = tk.Label(self.root, bg="#111923", fg="#b5c5d5", font=("Consolas", 10), anchor="w")
+        self.rotation.pack(fill="x", padx=16, pady=6)
 
     @staticmethod
     def _callback_error(exc_type, exc_value, traceback):
@@ -106,15 +140,10 @@ class LiveViewer:
             else:
                 right = np.zeros_like(left)
             canvas = np.concatenate([left, right], axis=1)
-            color = (60, 230, 80) if status["valid_now"] else (250, 130, 40)
-            cv2.putText(canvas, "LIVE CAMERA", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, .65, (80, 230, 250), 2)
-            age = status["pose_age_s"]
-            display_state = "STALE" if status["state"] == "TRACKING" and not status["valid_now"] else status["state"]
-            label = f'{display_state} / {"VALID" if status["valid_now"] else "NO CURRENT POSE"}'
-            cv2.putText(canvas, label, (left.shape[1] + 12, 25), cv2.FONT_HERSHEY_SIMPLEX, .55, color, 2)
-            if age is not None:
-                cv2.putText(canvas, f"pose frame age: {age:.2f}s", (left.shape[1] + 12, 48),
-                            cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
+            for x, title in [(0, "LIVE  /  RGB"), (left.shape[1], "POSE  /  RGB-D")]:
+                cv2.rectangle(canvas, (x + 10, 10), (x + 158, 36), (24, 36, 49), -1)
+                cv2.putText(canvas, title, (x + 18, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                            .49, (230, 241, 246), 1, cv2.LINE_AA)
             image = Image.fromarray(canvas)
             max_width = min(1280, self.root.winfo_screenwidth() - 60)
             if image.width > max_width:
@@ -140,18 +169,23 @@ class LiveViewer:
                 self._video_frames += 1
                 self._last_video = now
         pose = np.array(status["T_camera_object"]) if status["valid_now"] else None
-        values = "t [mm]: --       R: --"
-        if pose is not None:
-            t = pose[:3, 3] * 1000
-            values = f"t [mm]: X={t[0]:8.2f}  Y={t[1]:8.2f}  Z={t[2]:8.2f}\nR = " + np.array2string(pose[:3, :3], precision=3, suppress_small=True)
-        capture = status["capture"]
-        duration = status["processing_s"]
-        info = (f'{status["state"]} | {status["phase"]} | {status["reason"]}\n'
-                f'Camera {capture.get("received_fps", 0):.1f} Hz | valid poses '
-                f'{status["inference"].get("valid_pose_hz", 0):.1f} Hz (5s) | step '
-                f'{1000 * duration if duration else 0:.0f} ms | skipped {status["inference_skipped"]} | '
-                f'SDK drops {capture.get("sdk_dropped_color", 0)}\n{values}')
-        self.status.configure(text=status["error"] or info, fg="red" if status["error"] else "black")
+        for i, label in enumerate(self.xyz):
+            label.configure(text=f"{1000 * pose[i, 3]:.1f}" if pose is not None else "—")
+        rows = ("    ".join("[" + "  ".join(f"{v:+.3f}" for v in row) + "]" for row in pose[:3, :3])
+                if pose is not None else "—")
+        self.rotation.configure(text=f"R    {rows}")
+        valid = status["valid_now"]
+        states = {"TRACKING": "跟踪中" if valid else "位姿已过期", "LOST": "重新定位",
+                  "CONFIRMING": "确认位姿", "SEARCHING": "搜索目标", "STARTING": "启动中"}
+        self.badge.configure(text=states.get(status["state"], status["state"]),
+                             bg="#19443e" if valid else "#533f22", fg="#99efce" if valid else "#ffd898")
+        rate = status["inference"].get("valid_pose_hz", 0)
+        camera = status["capture"].get("received_fps", 0)
+        latency = status["pose_age_s"]
+        age = "—" if latency is None else f"{latency * 1000:.0f} ms"
+        self.status.configure(text=status["error"] or
+                              f"有效位姿   {rate:.1f} Hz     相机   {camera:.1f} Hz\n位姿帧龄   {age}     {status['reason']}",
+                              fg="#ff8990" if status["error"] else "#d0dce8")
         if now - self._last_saved >= .5 or self.session.finished:
             temporary = self.directory / "status.tmp"
             temporary.write_text(json.dumps(status, indent=2, allow_nan=False), encoding="utf-8")

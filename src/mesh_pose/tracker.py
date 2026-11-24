@@ -4,6 +4,7 @@ from time import perf_counter
 from dataclasses import replace
 import logging
 
+import cv2
 import numpy as np
 
 from .contracts import Candidate, Config, PoseBackend, Quality, RGBDFrame, TrackingResult
@@ -23,6 +24,7 @@ class Tracker:
         self._detection_pending = False
         self._frames_since_search = config.tracking.search_interval_frames
         self._previous_frame = None
+        self._motion_sample = None
         self._K = None
         self._last_good_pose = None
         self._search_steps = None
@@ -264,10 +266,34 @@ class Tracker:
         self.state = "CONFIRMING"
         return "confirming", quality
 
+    def _motion_retry(self, frame, previous_time):
+        if self._motion_sample is None or previous_time is None:
+            return None
+        earlier_time, earlier = self._motion_sample
+        ratio = min(1.5, (frame.timestamp_s - previous_time) / (previous_time - earlier_time))
+        seed = self._pose.copy()
+        seed[:3, 3] += ratio * (self._pose[:3, 3] - earlier[:3, 3])
+        rotvec = cv2.Rodrigues(self._pose[:3, :3] @ earlier[:3, :3].T)[0]
+        seed[:3, :3] = cv2.Rodrigues(rotvec * ratio)[0] @ self._pose[:3, :3]
+        distance, angle = pose_difference(self._pose, seed)
+        if distance > self.config.tracking.max_translation_step_m or angle > self.config.tracking.max_rotation_step_deg:
+            return None
+        pose = self.backend.track(frame, seed)
+        if not is_rigid_pose(pose):
+            return None
+        rendered = self.backend.render_depth(frame, pose)
+        if not self._quality(frame, pose, rendered=rendered).accepted:
+            return None
+        quality = self._mask_quality(frame, pose, rendered, strong=True)
+        return (pose, quality) if quality is not None else None
+
     def step(self, frame: RGBDFrame, *, cooperative: bool = False) -> TrackingResult:
         """Offline callers finish search; live callers yield between GPU batches."""
         start = perf_counter()
         try:
+            was_tracking = self.state == "TRACKING"
+            previous_pose = self._pose
+            previous_time = None
             fresh_confirmation = self._strong_confirmation
             frame.validate()
             if self._K is None:
@@ -299,7 +325,17 @@ class Tracker:
                 pose = self.backend.track(frame, self._pose.copy())
                 quality = self._quality(frame, pose)
                 reason = quality.reason
-                if quality.accepted:
+                if was_tracking and reason in {"depth_mismatch", "free_space_conflict"}:
+                    retried = self._motion_retry(frame, previous_time)
+                    if retried is not None:
+                        pose, quality = retried
+                        reason = "ok"
+                    else:
+                        refreshed = self._refresh_initialization(frame, self._pose, self.backend.detect(frame))
+                        if refreshed is not None:
+                            pose, quality = refreshed
+                            reason = "confirming_refreshed_initialization"
+                if quality.accepted and reason == "ok":
                     distance, angle = pose_difference(self._pose, pose)
                     if distance > self.config.tracking.max_translation_step_m or angle > self.config.tracking.max_rotation_step_deg:
                         reason = "motion_jump"
@@ -340,6 +376,7 @@ class Tracker:
                     reason = "tracked" if self.state == "TRACKING" else "confirming"
                     if self.state == "TRACKING":
                         self._strong_confirmation = False
+            self._motion_sample = ((previous_time, previous_pose) if was_tracking and self.state == "TRACKING" else None)
             if self.state == "TRACKING":
                 self._last_good_pose = self._pose.copy()
             exported = self.backend.to_object_frame(self._pose) if self.state == "TRACKING" else None

@@ -515,3 +515,18 @@ def test_mask_recovery_uses_prior_and_requires_another_frame(config):
     backend.track = lambda *_: pose(0.01)
     confirmed = tracker.step(frame(4))
     assert confirmed.state == "TRACKING" and confirmed.T_camera_object is not None
+
+
+def test_motion_retry_requires_current_depth_and_mask(config):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    tracker._pose = pose(.01)
+    tracker._motion_sample = (0.0, pose())
+    backend.track = lambda image, seed: seed
+    retried = tracker._motion_retry(frame(2), 1 / 30)
+    assert retried is not None
+    assert retried[0][0, 3] == pytest.approx(.02)
+    backend.candidates = []
+    assert tracker._motion_retry(frame(2), 1 / 30) is None
+    backend.candidates = [Candidate(np.ones((40, 60), bool), .8)]
+    assert tracker._motion_retry(frame(2, np.full((40, 60), .3, np.float32)), 1 / 30) is None

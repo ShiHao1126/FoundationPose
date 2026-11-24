@@ -176,11 +176,18 @@ class SpatialHubBackend:
         return refine_depth_pose(frame, pose, self.render_depth, self.geometry, mask)
 
     def track(self, frame: RGBDFrame, previous_pose: np.ndarray) -> np.ndarray:
-        # Every call starts from the state machine's accepted pose, never a rejected candidate.
-        self.estimator.current_pose = previous_pose
-        result = self.estimator.track(rgb=frame.rgb, depth=frame.depth_m, depth_unit="m",
-                                     iteration=self.config.track_iterations, verify_conf=False)
-        return refine_depth_pose(frame, result.pose[0], self.render_depth, self.geometry)
+        depth = self.estimator.depth_filter.apply(frame.depth_m, radius=2)
+        h, w = depth.shape
+        # Broadcast per-axis coordinates instead of building full UV grids.
+        # Keep the upstream multiply-then-divide order and invalid-depth rule.
+        xyz = np.empty((h, w, 3), dtype=np.float32)
+        xyz[..., 0] = (np.arange(w, dtype=np.float32) - frame.K[0, 2]) * depth / frame.K[0, 0]
+        xyz[..., 1] = (np.arange(h, dtype=np.float32)[:, None] - frame.K[1, 2]) * depth / frame.K[1, 1]
+        xyz[..., 2] = depth
+        xyz[depth < 0.001] = 0
+        pose = self.estimator.refiner.predict(frame.rgb, depth, xyz, previous_pose[None],
+                                              self.diameter_m, iteration=self.config.track_iterations)[0]
+        return refine_depth_pose(frame, pose, self.render_depth, self.geometry)
 
     def render_depth(self, frame: RGBDFrame, pose: np.ndarray) -> np.ndarray:
         return self.depth_renderer.render(frame.K, frame.depth_m.shape, pose)

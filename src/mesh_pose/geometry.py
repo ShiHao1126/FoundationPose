@@ -60,13 +60,14 @@ def refine_depth_pose(frame: RGBDFrame, initial_pose: np.ndarray,
     best_quality = verify_depth(frame.depth_m, rendered_depth, config, mask)
     height, width = frame.depth_m.shape
     for _ in range(config.icp_iterations):
-        ys, xs = np.where(rendered_depth > 0)
-        if len(xs) < config.min_pixels:
+        footprint = rendered_depth > 0
+        if np.count_nonzero(footprint) < config.min_pixels:
             break
         # Normals and linear algebra only need the object footprint. One-pixel
         # padding preserves the exact neighbor stencil used on the full image.
-        region = (slice(max(0, int(ys.min()) - 1), min(height, int(ys.max()) + 2)),
-                  slice(max(0, int(xs.min()) - 1), min(width, int(xs.max()) + 2)))
+        x, y, w, h = cv2.boundingRect(footprint.view(np.uint8))
+        region = (slice(max(0, y - 1), min(height, y + h + 1)),
+                  slice(max(0, x - 1), min(width, x + w + 1)))
         depth = rendered_depth[region]
         observed_depth = frame.depth_m[region]
         yy, xx = np.mgrid[region]
@@ -125,27 +126,32 @@ def verify_depth(observed: np.ndarray, rendered: np.ndarray, config: GeometryCon
     if rendered.shape != observed.shape or not np.isfinite(rendered).all():
         return Quality(False, "invalid_render")
     silhouette = rendered > 0
-    pixels = int(silhouette.sum())
+    pixels = int(np.count_nonzero(silhouette))
     if pixels < config.min_pixels:
         return Quality(False, "insufficient_projected_area", rendered_pixels=pixels)
-    has_depth = silhouette & (observed > 0)
-    residual = observed - rendered
-    # A closer observed surface may occlude the object; missing depth is not evidence of it.
+    # Only projected pixels enter the residual statistics. For IoU the
+    # union still includes mask pixels outside the projected footprint.
+    measured = observed[silhouette]
+    has_depth = measured > 0
+    residual = measured - rendered[silhouette]
     occluded = has_depth & (residual < -config.occlusion_tolerance_m)
     visible = has_depth & ~occluded
-    count = int(visible.sum())
-    coverage = float(has_depth.sum() / pixels)
+    residual = residual[visible]
+    count = len(residual)
+    coverage = np.count_nonzero(has_depth) / pixels
     fraction = count / pixels
-    inlier = float(np.count_nonzero(visible & (np.abs(residual) <= config.depth_tolerance_m)) / max(count, 1))
-    free_space = float(np.count_nonzero(visible & (residual > config.depth_tolerance_m)) / max(count, 1))
-    error = float(np.median(np.abs(residual[visible]))) if count else None
+    absolute = np.abs(residual)
+    inlier = np.count_nonzero(absolute <= config.depth_tolerance_m) / max(count, 1)
+    free_space = np.count_nonzero(residual > config.depth_tolerance_m) / max(count, 1)
+    error = float(np.median(absolute)) if count else None
     iou = None
     if mask is not None:
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != observed.shape:
             raise ValueError("Candidate mask dimensions do not match RGB-D")
-        projected_visible = silhouette & ~occluded
-        iou = float(np.count_nonzero(projected_visible & mask) / max(np.count_nonzero(projected_visible | mask), 1))
+        intersection = np.count_nonzero(mask[silhouette] & ~occluded)
+        union = np.count_nonzero(mask) + pixels - np.count_nonzero(occluded) - intersection
+        iou = intersection / max(union, 1)
     reason = "ok"
     for failed, label in (
         (coverage < config.min_depth_coverage, "insufficient_depth"),
