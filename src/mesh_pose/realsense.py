@@ -20,6 +20,7 @@ class RealSenseConfig:
     warmup_frames: int
     color_exposure: float | None = None  # SDK native units; RGB units differ from depth usec.
     color_gain: float | None = None
+    color_auto_exposure: bool = False  # With no overrides, preserve the current device settings.
 
     @classmethod
     def load(cls, path: Path) -> "RealSenseConfig":
@@ -30,6 +31,8 @@ class RealSenseConfig:
             value = getattr(settings, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(settings.color_auto_exposure) is not bool or (settings.color_auto_exposure and settings.color_exposure is not None):
+            raise ValueError("Automatic color exposure cannot be combined with manual overrides")
         if (settings.color_exposure is None) != (settings.color_gain is None):
             raise ValueError("Set color_exposure and color_gain together, or both null to keep device settings")
         if settings.color_exposure is not None:
@@ -67,19 +70,25 @@ class RealSenseSource:
         try:
             device = profile.get_device()
             color_sensor = device.first_color_sensor()
-            if self.config.color_exposure is not None:
+            if self.config.color_auto_exposure or self.config.color_exposure is not None:
                 self._color_sensor = color_sensor
                 self._saved_color_options = [(option, color_sensor.get_option(option)) for option in (
                     rs.option.exposure, rs.option.gain, rs.option.enable_auto_exposure)]
-                color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-                color_sensor.set_option(rs.option.exposure, self.config.color_exposure)
-                color_sensor.set_option(rs.option.gain, self.config.color_gain)
+                if self.config.color_auto_exposure:
+                    color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+                else:
+                    color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+                    color_sensor.set_option(rs.option.exposure, self.config.color_exposure)
+                    color_sensor.set_option(rs.option.gain, self.config.color_gain)
             self.depth_scale_m = device.first_depth_sensor().get_depth_scale()
             intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             if not np.allclose(intrinsics.coeffs, 0, atol=1e-9):
                 raise ValueError("This camera requires RGB-D rectification before the pinhole pose backend")
             self.K = np.array([[intrinsics.fx, 0, intrinsics.ppx],
                                [0, intrinsics.fy, intrinsics.ppy], [0, 0, 1]], dtype=np.float32)
+            self._align = rs.align(rs.stream.color)
+            for _ in range(self.config.warmup_frames):
+                pipeline.wait_for_frames(self.config.timeout_ms)
             self.metadata = {
                 "device": device.get_info(rs.camera_info.name),
                 "serial": device.get_info(rs.camera_info.serial_number),
@@ -93,9 +102,6 @@ class RealSenseSource:
                 "color_gain": color_sensor.get_option(rs.option.gain),
                 "color_auto_exposure": bool(color_sensor.get_option(rs.option.enable_auto_exposure)),
             }
-            self._align = rs.align(rs.stream.color)
-            for _ in range(self.config.warmup_frames):
-                pipeline.wait_for_frames(self.config.timeout_ms)
             self._previous_number = None
             self._previous_timestamp = None
             self._timestamp_domain = None

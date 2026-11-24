@@ -5,6 +5,7 @@
   "fps": 30,
   "timeout_ms": 3000,
   "warmup_frames": 30,
-  "color_exposure": 39,
-  "color_gain": 64
+  "color_exposure": null,
+  "color_gain": null,
+  "color_auto_exposure": true
 }

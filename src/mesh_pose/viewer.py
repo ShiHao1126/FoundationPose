@@ -118,7 +118,7 @@ class LiveViewer:
         tone.pack(side="right", padx=20)
         tk.Label(tone, text="预览亮度", bg="#111923", fg="#d0dce8",
                  font=("Microsoft YaHei UI", 10)).pack(side="left")
-        self.preview_gamma = tk.DoubleVar(value=1.7)
+        self.preview_gamma = tk.DoubleVar(value=1.0)
         tk.Scale(tone, from_=1.0, to=2.5, resolution=.1, variable=self.preview_gamma,
                  orient="horizontal", length=120, showvalue=False, highlightthickness=0,
                  bg="#111923", troughcolor="#344556", bd=0).pack(side="left", padx=8)

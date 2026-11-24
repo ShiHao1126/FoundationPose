@@ -118,3 +118,16 @@ def test_color_settings_restore_all_options_and_always_release_camera(fail_resto
     assert restored == [("exposure", 156), ("gain", 64), ("auto", 1)] and len(stopped) == 1
     source.close()
     assert len(stopped) == 1
+
+
+def test_auto_exposure_example_and_manual_override_are_mutually_exclusive(tmp_path):
+    from pathlib import Path
+    template = Path(__file__).resolve().parents[2] / "configs/realsense.example.json"
+    config = RealSenseConfig.load(template)
+    assert config.color_auto_exposure and config.color_exposure is None and config.color_gain is None
+    settings = json.loads(template.read_text())
+    settings.update(color_exposure=39, color_gain=64)
+    path = tmp_path / "camera.json"
+    path.write_text(json.dumps(settings))
+    with pytest.raises(ValueError, match="manual overrides"):
+        RealSenseConfig.load(path)
