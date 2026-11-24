@@ -75,15 +75,25 @@ class Tracker:
         region = (max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad),
                   min(width, int(xs.max()) + pad + 1), min(height, int(ys.max()) + pad + 1))
         check = self._registration_quality if strong else self._quality
-        matched = [check(frame, pose, c.mask, rendered) for c in self.backend.detect(frame, region=region)
-                   if c.similarity >= self.config.backend.min_detection_similarity]
-        accepted = max((q for q in matched if q.accepted), key=lambda q: q.rank, default=None)
+        def verify(image, area):
+            qualities = (check(frame, pose, c.mask, rendered)
+                         for c in self.backend.detect(image, region=area)
+                         if c.similarity >= self.config.backend.min_detection_similarity)
+            return max((q for q in qualities if q.accepted), key=lambda q: q.rank, default=None)
+
+        accepted = verify(frame, region)
+        if accepted is None and not strong:
+            # A dark crop can split one object into separate faces. Only retry
+            # its segmentation; all metric checks use the original exposure.
+            x0, y0, x1, y1 = region
+            gray = cv2.cvtColor(frame.rgb[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
+            median = float(np.median(gray)) / 255
+            if 0 < median < .45:
+                gamma = min(2.5, np.log(median) / np.log(.45))
+                lut = np.rint(255 * (np.arange(256) / 255) ** (1 / gamma)).astype(np.uint8)
+                accepted = verify(replace(frame, rgb=cv2.LUT(frame.rgb, lut)), region)
         if accepted is None and strong and region != (0, 0, width, height):
-            # Cropping changes FastSAM's proposals. A missing local mask is not
-            # evidence against a full-image mask passing the same strong checks.
-            matched = [check(frame, pose, c.mask, rendered) for c in self.backend.detect(frame)
-                       if c.similarity >= self.config.backend.min_detection_similarity]
-            accepted = max((q for q in matched if q.accepted), key=lambda q: q.rank, default=None)
+            accepted = verify(frame, None)
             logger.info("Full-image initialization verification: accepted=%s", accepted is not None)
         return accepted
 
@@ -210,16 +220,16 @@ class Tracker:
         return best, quality
 
     def _refresh_initialization(self, frame: RGBDFrame, seed: np.ndarray,
-                                candidates: list[Candidate] | None = None, *, surface_only: bool = False) -> tuple[np.ndarray, Quality] | None:
+                                candidates: list[Candidate] | None = None, *, rotation_budget: int | None = None) -> tuple[np.ndarray, Quality] | None:
         """A globally verified but old seed may need more than small-step tracking."""
-        steps = self._refresh_steps(frame, seed, candidates, surface_only=surface_only)
+        steps = self._refresh_steps(frame, seed, candidates, rotation_budget=rotation_budget)
         try:
             while True:
                 next(steps)
         except StopIteration as finished:
             return finished.value
 
-    def _refresh_steps(self, frame, seed, candidates, *, surface_only=False):
+    def _refresh_steps(self, frame, seed, candidates, *, rotation_budget=None):
         rendered = self.backend.render_depth(frame, seed)
         silhouette = rendered > 0
         recovering = candidates is not None
@@ -234,13 +244,14 @@ class Tracker:
         if relocation is not None:
             logger.info("Surface-aligned seed verified on frame %d", frame.sequence)
             return relocation
-        if surface_only:
+        eligible = [c for c in candidates[:self.config.backend.max_candidates]
+                    if c.similarity >= self.config.backend.min_detection_similarity
+                    and np.any(c.mask & silhouette)]
+        # During a live tracking failure, search at most one unambiguous region
+        # on this exposure. Leave competing regions to cooperative global search.
+        if rotation_budget is not None and len(eligible) > rotation_budget:
             return None
-        for candidate in candidates[:self.config.backend.max_candidates]:
-            if candidate.similarity < self.config.backend.min_detection_similarity:
-                continue
-            if not np.any(candidate.mask & silhouette):
-                continue
+        for candidate in eligible:
             yield  # Allow fresh-frame recovery before starting another rotation search.
             pose = self.backend.relocalize_seed(
                 frame, candidate.mask, seed.copy(), self.config.tracking.max_rotation_step_deg)
@@ -455,7 +466,7 @@ class Tracker:
                         reason = "ok"
                     else:
                         refreshed = self._refresh_initialization(frame, self._pose, self.backend.detect(frame),
-                                                                 surface_only=cooperative)
+                                                                 rotation_budget=1 if cooperative else None)
                         if refreshed is not None:
                             pose, quality = refreshed
                             reason = "confirming_refreshed_initialization"
@@ -478,7 +489,7 @@ class Tracker:
                 if fresh_confirmation and reason not in {"ok", "confirming_detection"}:
                     logger.info("Initialization confirmation rejected: %s", reason)
                     refreshed = self._refresh_initialization(frame, self._pose,
-                                                             surface_only=cooperative and self._last_good_pose is not None)
+                                                             rotation_budget=0 if cooperative and self._last_good_pose is not None else None)
                     if refreshed is not None:
                         pose, quality = refreshed
                         reason = "confirming_refreshed_initialization"

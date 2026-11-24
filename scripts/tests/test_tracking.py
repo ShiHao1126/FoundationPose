@@ -627,3 +627,51 @@ def test_pending_global_search_limits_local_detection_to_probe_cadence(config, m
     tracker.step(frame(30), cooperative=True)
     assert backend.detect_calls == 2
     tracker.close()
+
+
+def test_dim_periodic_mask_retry_still_checks_measured_depth(config):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    sample = frame()
+    sample.rgb.fill(12)
+    rendered = rendered_object(sample.depth_m.shape)
+    observed = []
+
+    def detect(image, *, region=None):
+        observed.append(int(image.rgb[0, 0, 0]))
+        return [Candidate(rendered > 0, .9)] if observed[-1] > 12 else []
+
+    backend.detect = detect
+    assert tracker._mask_quality(sample, pose(), rendered, strong=False).accepted
+    assert len(observed) == 2 and observed[0] == 12 and observed[1] > 12
+    assert np.all(sample.rgb == 12)
+    occluded = replace(sample, depth_m=np.full_like(rendered, .25))
+    assert tracker._mask_quality(occluded, pose(), rendered, strong=False) is None
+
+
+@pytest.mark.parametrize("competing", [False, True])
+def test_live_rotation_retry_requires_one_local_region_and_fresh_confirmation(config, competing):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    tracker.step(frame(0))
+    assert tracker.step(frame(1)).state == "TRACKING"
+    # The small-step tracker lands behind the observed surface.
+    backend.track = lambda *_: pose(.02)
+    backend.render_depth = lambda image, p: rendered_object(image.depth_m.shape) * (1.2 if p[0, 3] > .01 else 1)
+    calls = []
+    def rotate(*args):
+        calls.append(args)
+        return pose(angle=.6)
+    backend.relocalize_seed = rotate
+    if competing:
+        mask = backend.candidates[0].mask.copy()
+        mask[:, :20] = False
+        backend.candidates.append(Candidate(mask, .9))
+    result = tracker.step(frame(2), cooperative=True)
+    assert result.T_camera_object is None
+    if competing:
+        assert result.state == "LOST" and not calls
+    else:
+        assert result.state == "CONFIRMING" and len(calls) == 1
+        backend.track = lambda _, initial: initial.copy()
+        assert tracker.step(frame(3), cooperative=True).state == "TRACKING"
