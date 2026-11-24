@@ -88,22 +88,23 @@ class Tracker:
         return accepted
 
     def _verify_registration_candidates(self, frame: RGBDFrame, pose: np.ndarray,
-                                         candidates: list[Candidate]) -> Quality:
+                                         candidates: list[Candidate], rendered=None) -> Quality:
         """The seed mask proposes a pose; any qualified full silhouette can verify it."""
         if not is_rigid_pose(pose):
             return Quality(False, "invalid_pose")
-        rendered = self.backend.render_depth(frame, pose)
+        if rendered is None:
+            rendered = self.backend.render_depth(frame, pose)
         qualities = [self._registration_quality(frame, pose, c.mask, rendered) for c in candidates
                      if c.similarity >= self.config.backend.min_detection_similarity]
         return max(qualities, key=lambda q: (q.accepted, q.rank),
                    default=Quality(False, "no_detection"))
 
-    def _recover_local(self, frame: RGBDFrame) -> Quality | None:
+    def _local_fit(self, frame: RGBDFrame, previous_render=None):
         if self._last_good_pose is None:
             return None
         # The retained pose is a private hint, never a published measurement.
         # Do not refine onto a foreground occluder when the old footprint is hidden.
-        previous_quality = self._quality(frame, self._last_good_pose)
+        previous_quality = self._quality(frame, self._last_good_pose, rendered=previous_render)
         if previous_quality.reason in {"insufficient_visibility", "insufficient_depth"}:
             return None
         pose = self.backend.track(frame, self._last_good_pose.copy())
@@ -115,6 +116,13 @@ class Tracker:
         rendered = self.backend.render_depth(frame, pose)
         if not self._quality(frame, pose, rendered=rendered).accepted:
             return None
+        return pose, rendered
+
+    def _recover_local(self, frame: RGBDFrame) -> Quality | None:
+        fit = self._local_fit(frame)
+        if fit is None:
+            return None
+        pose, rendered = fit
         quality = self._mask_quality(frame, pose, rendered, strong=True)
         if quality is not None:
             self._cancel_search()
@@ -138,6 +146,18 @@ class Tracker:
         region = (max(0, x - pad[0]), max(0, y - pad[1]),
                   min(frame.rgb.shape[1], x + w + pad[0]), min(frame.rgb.shape[0], y + h + pad[1]))
         candidates = self.backend.detect(frame, region=region)
+        # Both local hypotheses share one detection on this new frame. Repeating
+        # full-image segmentation between every GPU batch stalls global recovery.
+        if not candidates:
+            return None
+        fit = self._local_fit(frame, previous_render=rendered)
+        if fit is not None:
+            pose, fitted_depth = fit
+            quality = self._verify_registration_candidates(frame, pose, candidates, fitted_depth)
+            if quality.accepted:
+                self._cancel_search()
+                self._begin_recovery(pose)
+                return quality
         match = self._surface_relocation(frame, seed, rendered, candidates)
         if match is None:
             return None
@@ -244,15 +264,16 @@ class Tracker:
         return best, quality
 
     def _search(self, frame: RGBDFrame, cooperative: bool) -> tuple[str, Quality | None]:
+        if cooperative and self._search_steps is not None:
+            match = self._probe_reappearance(frame)
+            if match is not None:
+                return "confirming_mask_recovery", match
+            return self._advance_search(True, recovery_slice=self._last_good_pose is not None)
         quality = self._recover_local(frame)
         if quality is not None:
             return "confirming_local_recovery", quality
         if self._search_steps is not None:
-            if cooperative:
-                match = self._probe_reappearance(frame)
-                if match is not None:
-                    return "confirming_mask_recovery", match
-            return self._advance_search(cooperative, recovery_slice=self._last_good_pose is not None)
+            return self._advance_search(cooperative)
         self._frames_since_search += 1
         if self._frames_since_search < self.config.tracking.search_interval_frames:
             return "waiting_to_search", None

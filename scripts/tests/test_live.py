@@ -12,7 +12,7 @@ import pytest
 from mesh_pose.contracts import Config, TrackingResult
 from mesh_pose.live import Estimate, LiveSession, ReceivedFrame
 from mesh_pose.sequence import RunWriter
-from mesh_pose.viewer import live_status
+from mesh_pose.viewer import live_status, preview_lut, preview_rgb
 from test_tracking import Backend, frame
 
 
@@ -113,3 +113,16 @@ def test_live_status_invalidates_old_pose_fault_and_stop():
         status = live_status({**snapshot, "error": error}, now, .5, stopping)
         assert not status["valid_now"] and status["T_camera_object"] is None
     assert not replace(estimate, result=replace(result, T_camera_object=None)).is_current(100.3, .5)
+
+
+def test_preview_denoise_preserves_input_and_silhouette():
+    rgb = np.full((40, 60, 3), 20, np.uint8)
+    rgb[:, 30:] = 215
+    rgb[10, 10] = 27
+    original = rgb.copy()
+    lut = preview_lut(1.7)
+    smoothed = preview_rgb(rgb, lut, True)
+    assert np.array_equal(rgb, original)
+    assert np.array_equal(preview_rgb(rgb, lut, False), lut[original])
+    assert smoothed[10, 10, 0] < lut[27]
+    assert np.array_equal(smoothed[20, 29:31], lut[original[20, 29:31]])

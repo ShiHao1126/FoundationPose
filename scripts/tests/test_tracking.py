@@ -605,3 +605,25 @@ def test_motion_prior_must_fit_current_depth_before_being_preferred(config):
     assert tracker._prefer_motion_seed(frame(), predicted)
     assert not tracker._prefer_motion_seed(frame(depth=np.full((40, 60), .55, np.float32)), predicted)
     assert not tracker._prefer_motion_seed(frame(), pose(.001))
+
+
+def test_pending_global_search_limits_local_detection_to_probe_cadence(config, monkeypatch):
+    from itertools import count, repeat
+
+    backend = Backend()
+    backend.candidates = []
+    tracker = Tracker(backend, config)
+    tracker.state = "LOST"
+    tracker._last_good_pose = pose()
+    tracker._search_steps = (tick for tick in repeat(None))
+    # Advance one simulated GPU batch per frame.
+    monkeypatch.setattr("mesh_pose.tracker.perf_counter", count().__next__)
+    for i in range(1, 15):
+        result = tracker.step(frame(i), cooperative=True)
+        assert result.reason == "global_search_in_progress"
+        assert result.T_camera_object is None
+    assert backend.detect_calls == 1
+    assert backend.last_region is not None
+    tracker.step(frame(30), cooperative=True)
+    assert backend.detect_calls == 2
+    tracker.close()

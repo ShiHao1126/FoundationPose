@@ -11,8 +11,15 @@ from PIL import Image, ImageTk
 
 
 def preview_lut(gamma: float) -> np.ndarray:
-    """Display transfer with fixed black/white points; gamma=1 shows the raw RGB."""
+    """Display transfer with fixed black/white points and identity at gamma=1."""
     return np.rint(255 * (np.arange(256) / 255) ** (1 / gamma)).astype(np.uint8)
+
+
+def preview_rgb(rgb: np.ndarray, lut: np.ndarray, denoise: bool) -> np.ndarray:
+    # Filter one exposure at a time, before gamma amplifies shadow noise.
+    if denoise:
+        rgb = cv2.bilateralFilter(rgb, 5, 20, 2)
+    return cv2.LUT(rgb, lut)
 
 
 def annotate_pose(rgb, K, pose, bounds):
@@ -114,6 +121,11 @@ class LiveViewer:
         tk.Scale(tone, from_=1.0, to=2.5, resolution=.1, variable=self.preview_gamma,
                  orient="horizontal", length=120, showvalue=False, highlightthickness=0,
                  bg="#111923", troughcolor="#344556", bd=0).pack(side="left", padx=8)
+        self.denoise = tk.BooleanVar(value=True)
+        tk.Checkbutton(tone, text="降噪", variable=self.denoise, bg="#111923", fg="#d0dce8",
+                       activebackground="#111923", activeforeground="white", selectcolor="#344556",
+                       highlightthickness=0).pack(side="left")
+        self._preview_cache = {}
         self._gamma = None
         self.picture = tk.Label(self.root, bg="#111923", borderwidth=0)
         self.picture.pack(fill="x")
@@ -138,6 +150,14 @@ class LiveViewer:
         # Tk otherwise prints callback failures and leaves a frozen UI running.
         raise exc_value.with_traceback(traceback)
 
+    def _display_image(self, frame, settings, slot):
+        key = (frame.sequence, settings)
+        cached = self._preview_cache.get(slot)
+        if cached is None or cached[0] != key:
+            cached = key, preview_rgb(frame.rgb, self._display_lut, settings[1])
+            self._preview_cache[slot] = cached
+        return cached[1]
+
     def _tick(self):
         now = monotonic()
         if (self.duration_s > 0 and now - self.started >= self.duration_s) or (self.directory / "STOP").exists():
@@ -150,9 +170,12 @@ class LiveViewer:
             if gamma != self._gamma:
                 self._display_lut = preview_lut(gamma)
                 self._gamma = gamma
-            left = cv2.LUT(frame.frame.rgb, self._display_lut)
+            settings = (gamma, self.denoise.get())
+            left = self._display_image(frame.frame, settings, "live")
             if estimate is not None:
-                right = annotate_pose(cv2.LUT(estimate.source.frame.rgb, self._display_lut), estimate.source.frame.K,
+                right_rgb = (left if estimate.source.frame.sequence == frame.frame.sequence else
+                             self._display_image(estimate.source.frame, settings, "pose"))
+                right = annotate_pose(right_rgb, estimate.source.frame.K,
                                       estimate.result.T_camera_object if status["valid_now"] else None,
                                       snapshot["bounds"])
             else:
