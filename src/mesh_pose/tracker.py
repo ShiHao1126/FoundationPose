@@ -29,6 +29,7 @@ class Tracker:
         self._last_good_pose = None
         self._search_steps = None
         self._retry_full = False
+        self._mask_probe_time = -np.inf
         self._strong_confirmation = False
 
     def _cancel_search(self) -> None:
@@ -120,6 +121,31 @@ class Tracker:
             self._begin_recovery(pose)
         return quality
 
+    def _probe_reappearance(self, frame):
+        """Look around the last pose while an older registration is still running."""
+        seed = self._last_good_pose
+        if seed is None or frame.timestamp_s - self._mask_probe_time < self.config.tracking.recovery_probe_interval_s:
+            return None
+        self._mask_probe_time = frame.timestamp_s
+        rendered = self.backend.render_depth(frame, seed)
+        footprint = rendered > 0
+        if not footprint.any():
+            return None
+        x, y, w, h = cv2.boundingRect(footprint.view(np.uint8))
+        # Cover the permitted lateral displacement at the object's nearest depth.
+        z = rendered[footprint].min()
+        pad = np.ceil(frame.K[[0, 1], [0, 1]] * self.config.tracking.max_translation_step_m / z).astype(int)
+        region = (max(0, x - pad[0]), max(0, y - pad[1]),
+                  min(frame.rgb.shape[1], x + w + pad[0]), min(frame.rgb.shape[0], y + h + pad[1]))
+        candidates = self.backend.detect(frame, region=region)
+        match = self._surface_relocation(frame, seed, rendered, candidates)
+        if match is None:
+            return None
+        pose, quality = match
+        self._cancel_search()
+        self._begin_recovery(pose)
+        return quality
+
     def _begin_recovery(self, pose: np.ndarray) -> None:
         self._retry_full = False
         self._pose = pose.copy()
@@ -164,8 +190,16 @@ class Tracker:
         return best, quality
 
     def _refresh_initialization(self, frame: RGBDFrame, seed: np.ndarray,
-                                candidates: list[Candidate] | None = None) -> tuple[np.ndarray, Quality] | None:
+                                candidates: list[Candidate] | None = None, *, surface_only: bool = False) -> tuple[np.ndarray, Quality] | None:
         """A globally verified but old seed may need more than small-step tracking."""
+        steps = self._refresh_steps(frame, seed, candidates, surface_only=surface_only)
+        try:
+            while True:
+                next(steps)
+        except StopIteration as finished:
+            return finished.value
+
+    def _refresh_steps(self, frame, seed, candidates, *, surface_only=False):
         rendered = self.backend.render_depth(frame, seed)
         silhouette = rendered > 0
         recovering = candidates is not None
@@ -180,11 +214,14 @@ class Tracker:
         if relocation is not None:
             logger.info("Surface-aligned seed verified on frame %d", frame.sequence)
             return relocation
+        if surface_only:
+            return None
         for candidate in candidates[:self.config.backend.max_candidates]:
             if candidate.similarity < self.config.backend.min_detection_similarity:
                 continue
             if not np.any(candidate.mask & silhouette):
                 continue
+            yield  # Allow fresh-frame recovery before starting another rotation search.
             pose = self.backend.relocalize_seed(
                 frame, candidate.mask, seed.copy(), self.config.tracking.max_rotation_step_deg)
             if not is_rigid_pose(pose):
@@ -211,6 +248,10 @@ class Tracker:
         if quality is not None:
             return "confirming_local_recovery", quality
         if self._search_steps is not None:
+            if cooperative:
+                match = self._probe_reappearance(frame)
+                if match is not None:
+                    return "confirming_mask_recovery", match
             return self._advance_search(cooperative, recovery_slice=self._last_good_pose is not None)
         self._frames_since_search += 1
         if self._frames_since_search < self.config.tracking.search_interval_frames:
@@ -237,7 +278,8 @@ class Tracker:
         last_quality = None
         candidates = self.backend.detect(frame)
         if self._last_good_pose is not None and candidates:
-            refreshed = self._refresh_initialization(frame, self._last_good_pose, candidates)
+            self._mask_probe_time = frame.timestamp_s
+            refreshed = yield from self._refresh_steps(frame, self._last_good_pose, candidates)
             if refreshed is not None:
                 pose, quality = refreshed
                 self._begin_recovery(pose)
@@ -305,7 +347,7 @@ class Tracker:
         self.state = "CONFIRMING"
         return "confirming", quality
 
-    def _motion_retry(self, frame, previous_time):
+    def _motion_seed(self, frame, previous_time):
         if self._motion_sample is None or previous_time is None:
             return None
         earlier_time, earlier = self._motion_sample
@@ -316,6 +358,24 @@ class Tracker:
         seed[:3, :3] = cv2.Rodrigues(rotvec * ratio)[0] @ self._pose[:3, :3]
         distance, angle = pose_difference(self._pose, seed)
         if distance > self.config.tracking.max_translation_step_m or angle > self.config.tracking.max_rotation_step_deg:
+            return None
+        return seed
+
+    def _prefer_motion_seed(self, frame, seed):
+        if seed is None:
+            return False
+        distance, angle = pose_difference(self._pose, seed)
+        surface_travel = distance + self.backend.diameter_m * .5 * np.deg2rad(angle)
+        if surface_travel < self.config.geometry.depth_tolerance_m:
+            return False
+        old = self._quality(frame, self._pose)
+        predicted = self._quality(frame, seed)
+        # Depth selects the starting point; the fitted measurement must still
+        # pass the normal motion and geometry checks before publication.
+        return predicted.accepted and (not old.accepted or predicted.rank > old.rank)
+
+    def _retry_from_seed(self, frame, seed):
+        if seed is None:
             return None
         pose = self.backend.track(frame, seed)
         if not is_rigid_pose(pose):
@@ -361,16 +421,20 @@ class Tracker:
             elif self._pose is None:
                 reason, quality = self._search(frame, cooperative)
             else:
-                pose = self.backend.track(frame, self._pose.copy())
+                seed = self._motion_seed(frame, previous_time) if was_tracking else None
+                use_prediction = self._prefer_motion_seed(frame, seed)
+                first = seed if use_prediction else self._pose
+                pose = self.backend.track(frame, first.copy())
                 quality = self._quality(frame, pose)
                 reason = quality.reason
                 if was_tracking and reason in {"depth_mismatch", "free_space_conflict", "insufficient_visibility"}:
-                    retried = self._motion_retry(frame, previous_time)
+                    retried = self._retry_from_seed(frame, self._pose if use_prediction else seed)
                     if retried is not None:
                         pose, quality = retried
                         reason = "ok"
                     else:
-                        refreshed = self._refresh_initialization(frame, self._pose, self.backend.detect(frame))
+                        refreshed = self._refresh_initialization(frame, self._pose, self.backend.detect(frame),
+                                                                 surface_only=cooperative)
                         if refreshed is not None:
                             pose, quality = refreshed
                             reason = "confirming_refreshed_initialization"
@@ -392,7 +456,8 @@ class Tracker:
                                 quality = accepted
                 if fresh_confirmation and reason not in {"ok", "confirming_detection"}:
                     logger.info("Initialization confirmation rejected: %s", reason)
-                    refreshed = self._refresh_initialization(frame, self._pose)
+                    refreshed = self._refresh_initialization(frame, self._pose,
+                                                             surface_only=cooperative and self._last_good_pose is not None)
                     if refreshed is not None:
                         pose, quality = refreshed
                         reason = "confirming_refreshed_initialization"

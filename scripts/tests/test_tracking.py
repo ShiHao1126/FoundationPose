@@ -257,14 +257,19 @@ def test_occlusion_during_detection_recheck_loses_immediately(config):
     assert lost.state == "LOST" and lost.T_camera_object is None
 
 
-def test_latest_local_recovery_preempts_old_global_search(config):
+def test_latest_local_recovery_preempts_old_global_search(config, monkeypatch):
+    # Advance one cooperative batch per test frame regardless of CPU speed.
+    import itertools
+    monkeypatch.setattr("mesh_pose.tracker.perf_counter", itertools.count().__next__)
     backend = Backend()
     tracker = Tracker(backend, config)
     tracker.step(frame(0))
     tracker.step(frame(1))
     tracker.step(frame(2, np.full((40, 60), .8, np.float32)))
     closed = []
+    started = []
     def staged(image, mask):
+        started.append(True)
         try:
             for _ in range(10):
                 yield
@@ -272,12 +277,16 @@ def test_latest_local_recovery_preempts_old_global_search(config):
         finally:
             closed.append(True)
     backend.register_steps = staged
-    searching = tracker.step(frame(3, np.full((40, 60), .8, np.float32)), cooperative=True)
-    assert searching.reason == "global_search_in_progress" and searching.T_camera_object is None
-    pending = tracker.step(frame(4))
+    for index in range(3, 12):
+        searching = tracker.step(frame(index, np.full((40, 60), .8, np.float32)), cooperative=True)
+        assert searching.reason == "global_search_in_progress" and searching.T_camera_object is None
+        if started:
+            break
+    assert started
+    pending = tracker.step(frame(index + 1))
     assert pending.reason == "confirming_local_recovery" and pending.T_camera_object is None
     assert closed == [True]
-    recovered = tracker.step(frame(5))
+    recovered = tracker.step(frame(index + 2))
     assert recovered.state == "TRACKING" and backend.register_calls == 1
 
 
@@ -523,13 +532,13 @@ def test_motion_retry_requires_current_depth_and_mask(config):
     tracker._pose = pose(.01)
     tracker._motion_sample = (0.0, pose())
     backend.track = lambda image, seed: seed
-    retried = tracker._motion_retry(frame(2), 1 / 30)
+    retried = tracker._retry_from_seed(frame(2), tracker._motion_seed(frame(2), 1 / 30))
     assert retried is not None
     assert retried[0][0, 3] == pytest.approx(.02)
     backend.candidates = []
-    assert tracker._motion_retry(frame(2), 1 / 30) is None
+    assert tracker._retry_from_seed(frame(2), tracker._motion_seed(frame(2), 1 / 30)) is None
     backend.candidates = [Candidate(np.ones((40, 60), bool), .8)]
-    assert tracker._motion_retry(frame(2, np.full((40, 60), .3, np.float32)), 1 / 30) is None
+    assert tracker._retry_from_seed(frame(2, np.full((40, 60), .3, np.float32)), tracker._motion_seed(frame(2), 1 / 30)) is None
 
 
 def test_surface_relocation_preserves_cad_to_visible_surface_offset(config):
@@ -551,3 +560,48 @@ def test_surface_relocation_preserves_cad_to_visible_surface_offset(config):
     assert surface_center(old, mask & (old == 0), image.K, 100) is None
     assert tracker._surface_relocation(frame(depth=np.full(old.shape, .2, np.float32)),
                                        seed, old, [candidate]) is None
+
+
+def test_new_mask_can_preempt_search_only_after_verified_relocation(config):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    tracker._last_good_pose = pose()
+    tracker.state = "LOST"
+    def pending():
+        while True:
+            yield
+    tracker._search_steps = pending()
+    # Old pose is on background. Only the mask on the new frame covers the object.
+    old_x, new_x = 16, 20
+    def render(image, estimate):
+        z = np.zeros((40, 60), np.float32)
+        x = new_x if estimate[0, 3] > .01 else old_x
+        z[12:26, x:x + 14] = .5
+        return z
+    backend.render_depth = render
+    backend.track = lambda image, seed: seed
+    shifted = pose((new_x - old_x) * .5 / 60)
+    observed = render(frame(), shifted)
+    backend.candidates = []
+    assert tracker.step(frame(1, observed), cooperative=True).T_camera_object is None
+    assert tracker._search_steps is not None
+    backend.candidates = [Candidate(observed > 0, .8)]
+    # Reject ordinary small-step refinement to isolate the fresh mask probe.
+    backend.track = lambda image, seed: seed if seed[0, 3] > .01 else np.zeros((4, 4))
+    pending_result = tracker.step(frame(30, observed), cooperative=True)
+    assert pending_result.reason == "confirming_mask_recovery" and pending_result.T_camera_object is None
+    assert tracker._search_steps is None
+    assert tracker.step(frame(31, observed)).state == "TRACKING"
+
+
+def test_motion_prior_must_fit_current_depth_before_being_preferred(config):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    tracker._pose = pose()
+    predicted = pose(.03)
+    backend.render_depth = lambda image, seed: np.full(image.depth_m.shape,
+                                                       .5 if seed[0, 3] > .01 else .55,
+                                                       dtype=np.float32)
+    assert tracker._prefer_motion_seed(frame(), predicted)
+    assert not tracker._prefer_motion_seed(frame(depth=np.full((40, 60), .55, np.float32)), predicted)
+    assert not tracker._prefer_motion_seed(frame(), pose(.001))

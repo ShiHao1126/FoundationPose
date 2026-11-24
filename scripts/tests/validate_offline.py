@@ -56,7 +56,8 @@ def main(args: Args) -> None:
             if n <= index < n + 3:
                 # Flat, distant background tests free-space rejection; depth is not missing.
                 frame = replace(frame, rgb=np.zeros_like(frame.rgb), depth_m=np.full_like(frame.depth_m, 2.0))
-            result = tracker.step(frame)
+            # Complete the cold search first; exercise live scheduling during loss and recovery.
+            result = tracker.step(frame, cooperative=index >= n)
             writer.write(frame, result)
             results.append(result)
             print(index, result.state, result.reason, round(result.elapsed_s, 3),
@@ -64,7 +65,11 @@ def main(args: Args) -> None:
         initial = any(r.T_camera_object is not None for r in results[:n])
         lost = all(r.T_camera_object is None for r in results[n:n + 3])
         recovered = any(r.T_camera_object is not None for r in results[n + 3:])
-        summary = {"automatic_initialization": initial, "no_valid_pose_during_injected_loss": lost,
+        first_valid = next((i for i in range(n + 3, len(results))
+                            if results[i].T_camera_object is not None), None)
+        summary = {"first_valid_frame_after_return": first_valid - (n + 3) + 1 if recovered else None,
+                   "recovery_compute_s": sum(r.elapsed_s for r in results[n + 3:first_valid + 1]) if recovered else None,
+                   "automatic_initialization": initial, "no_valid_pose_during_injected_loss": lost,
                    "automatic_recovery": recovered, "hardware_tested": False,
                    "accuracy_measured": False, "frames": len(results)}
         (writer.directory / "validation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

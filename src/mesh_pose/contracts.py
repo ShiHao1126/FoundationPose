@@ -47,6 +47,7 @@ class TrackingConfig:
     max_frame_gap_s: float
     max_translation_step_m: float
     max_rotation_step_deg: float
+    recovery_probe_interval_s: float = 0.75
 
 
 @dataclass(frozen=True)
