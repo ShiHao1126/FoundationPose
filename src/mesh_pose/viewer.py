@@ -78,6 +78,7 @@ def live_status(snapshot, now: float, max_pose_age_s: float, stopping: bool) -> 
         "T_camera_object": result.T_camera_object.tolist() if valid else None,
         "processing_s": result.elapsed_s if result else None,
         "quality": result.to_record()["quality"] if result else None,
+        "quality_sequence": result.quality_sequence if result else None,
         "capture": snapshot["capture"], "inference_skipped": snapshot["inference_skipped"],
         "inference": snapshot.get("inference", {}),
         "translation_unit": "m", "camera_axes": "x-right,y-down,z-forward",
@@ -216,8 +217,9 @@ class LiveViewer:
                 if pose is not None else "—")
         self.rotation.configure(text=f"R    {rows}")
         valid = status["valid_now"]
+        confirmation = "复核目标轮廓" if status["reason"] == "confirming_detection" else "确认新位姿"
         states = {"TRACKING": "跟踪中" if valid else "位姿已过期", "LOST": "重新定位",
-                  "CONFIRMING": "确认位姿", "SEARCHING": "搜索目标", "STARTING": "启动中"}
+                  "CONFIRMING": confirmation, "SEARCHING": "搜索目标", "STARTING": "启动中"}
         self.badge.configure(text=states.get(status["state"], status["state"]),
                              bg="#19443e" if valid else "#533f22", fg="#99efce" if valid else "#ffd898")
         rate = status["inference"].get("valid_pose_hz", 0)

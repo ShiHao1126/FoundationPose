@@ -135,6 +135,7 @@ class TrackingResult:
     T_camera_object: np.ndarray | None  # original CAD axes/origin, metric translation
     quality: Quality | None
     elapsed_s: float
+    quality_sequence: int | None = None  # RGB-D observation used for the reported quality
 
     def to_record(self) -> dict:
         record = asdict(self)
