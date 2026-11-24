@@ -115,22 +115,29 @@ class Tracker:
         quality = self._mask_quality(frame, pose, rendered, strong=True)
         if quality is not None:
             self._cancel_search()
-            self._retry_full = False
-            self._pose = pose.copy()
-            self._confirmed = 1
-            self._tracked = 0
-            self._strong_confirmation = True
-            self.state = "CONFIRMING"
+            self._begin_recovery(pose)
         return quality
 
-    def _refresh_initialization(self, frame: RGBDFrame, seed: np.ndarray) -> tuple[np.ndarray, Quality] | None:
+    def _begin_recovery(self, pose: np.ndarray) -> None:
+        self._retry_full = False
+        self._pose = pose.copy()
+        self._confirmed = 1
+        self._tracked = 0
+        self._strong_confirmation = True
+        self.state = "CONFIRMING"
+
+    def _refresh_initialization(self, frame: RGBDFrame, seed: np.ndarray,
+                                candidates: list[Candidate] | None = None) -> tuple[np.ndarray, Quality] | None:
         """A globally verified but old seed may need more than small-step tracking."""
         rendered = self.backend.render_depth(frame, seed)
         silhouette = rendered > 0
-        candidates = self.backend.detect(frame)
+        recovering = candidates is not None
+        matches = []
+        if candidates is None:
+            candidates = self.backend.detect(frame)
         # Use prior spatial support to prioritize masks without asking the user
         # to click. Final pose, motion and strong mask/depth gates remain mandatory.
-        candidates.sort(key=lambda c: np.count_nonzero(c.mask & silhouette)
+        candidates = sorted(candidates, key=lambda c: np.count_nonzero(c.mask & silhouette)
                         / max(np.count_nonzero(c.mask | silhouette), 1), reverse=True)
         for candidate in candidates[:self.config.backend.max_candidates]:
             if candidate.similarity < self.config.backend.min_detection_similarity:
@@ -148,15 +155,22 @@ class Tracker:
             logger.info("Fresh initialization: accepted=%s reason=%s inliers=%.3f mask_iou=%s",
                         quality.accepted, quality.reason, quality.inlier_ratio, quality.mask_iou)
             if quality.accepted:
-                return pose, quality
-        return None
+                if not recovering:
+                    return pose, quality
+                matches.append((pose, quality))
+        if not matches:
+            return None
+        best, quality = max(matches, key=lambda item: item[1].rank)
+        if any(pose_difference(best, other)[0] > self.backend.diameter_m * 0.35 for other, _ in matches):
+            return None
+        return best, quality
 
     def _search(self, frame: RGBDFrame, cooperative: bool) -> tuple[str, Quality | None]:
         quality = self._recover_local(frame)
         if quality is not None:
             return "confirming_local_recovery", quality
         if self._search_steps is not None:
-            return self._advance_search(cooperative)
+            return self._advance_search(cooperative, recovery_slice=self._last_good_pose is not None)
         self._frames_since_search += 1
         if self._frames_since_search < self.config.tracking.search_interval_frames:
             return "waiting_to_search", None
@@ -164,11 +178,14 @@ class Tracker:
         self._search_steps = self._global_search(frame, cooperative)
         return self._advance_search(cooperative)
 
-    def _advance_search(self, cooperative):
+    def _advance_search(self, cooperative, *, recovery_slice=False):
+        # Probe the newest image between short groups of GPU work during loss.
+        # A single upstream batch can run longer than this scheduling budget.
+        deadline = perf_counter() + (0.15 if recovery_slice else 0.0)
         try:
             while True:
                 next(self._search_steps)
-                if cooperative:
+                if cooperative and perf_counter() >= deadline:
                     return "global_search_in_progress", None
         except StopIteration as finished:
             self._search_steps = None
@@ -178,6 +195,12 @@ class Tracker:
         hypotheses = []
         last_quality = None
         candidates = self.backend.detect(frame)
+        if self._last_good_pose is not None and candidates:
+            refreshed = self._refresh_initialization(frame, self._last_good_pose, candidates)
+            if refreshed is not None:
+                pose, quality = refreshed
+                self._begin_recovery(pose)
+                return "confirming_mask_recovery", quality
         nominated = []
         full_retry = self._retry_full
         self._retry_full = False

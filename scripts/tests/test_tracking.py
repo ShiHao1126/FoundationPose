@@ -498,3 +498,20 @@ def test_live_shortlist_miss_runs_full_search_on_new_input(config):
     assert backend.register_calls == 0
     assert tracker.step(frame(2), cooperative=True).state == "CONFIRMING"
     assert backend.register_calls == 1
+
+
+def test_mask_recovery_uses_prior_and_requires_another_frame(config):
+    backend = Backend()
+    tracker = Tracker(backend, config)
+    tracker.step(frame(0))
+    tracker.step(frame(1))
+    tracker.step(frame(2, np.full((40, 60), 0.3, np.float32)))
+    # Local tracking misses. The automatic mask gives a corrected center.
+    backend.track = lambda *_: np.zeros((4, 4))
+    backend.relocalize_seed = lambda *_: pose(0.01)
+    pending = tracker.step(frame(3))
+    assert pending.reason == "confirming_mask_recovery" and pending.T_camera_object is None
+    assert backend.register_calls == 1
+    backend.track = lambda *_: pose(0.01)
+    confirmed = tracker.step(frame(4))
+    assert confirmed.state == "TRACKING" and confirmed.T_camera_object is not None
