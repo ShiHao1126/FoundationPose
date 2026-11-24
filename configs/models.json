@@ -1,0 +1,6 @@
+{
+  "refiner": {"repo_id": "SpatialHub/foundationpose", "revision": "7f3c15896eeed50a3f024260543525c6f1d036f4", "filename": "refine_net.onnx"},
+  "scorer": {"repo_id": "SpatialHub/foundationpose", "revision": "7f3c15896eeed50a3f024260543525c6f1d036f4", "filename": "score_net.onnx"},
+  "descriptor": {"repo_id": "SpatialHub/dinov2-onnx", "revision": "ed51820fb82ecd954b75a3db75e63e386b0ba1f9", "filename": "dinov2_vits14.onnx"},
+  "segmentor": {"repo_id": "SpatialHub/fastsam-onnx", "revision": "47e724babb1a5877368a218b76f04b0443eef077", "filename": "FastSAM-s.onnx"}
+}

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh-pose-tracking"
+version = "0.1.0"
+description = "Automatic RGB-D mesh pose tracking and relocalization"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2,<3", "opencv-python-headless>=5,<6", "typed-argument-parser>=1.12,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["scripts/tests"]
+
