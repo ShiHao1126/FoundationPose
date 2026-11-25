@@ -43,6 +43,8 @@ python -m pip install -e .
 python -m pytest scripts/tests -q
 ```
 
+安装本包会编译 CPU 端的 C++ 图集打包扩展。Windows 需要 Visual Studio C++ 生成工具和 Windows SDK。
+
 新机器先获取固定依赖，然后创建环境：
 
 ```powershell

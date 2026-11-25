@@ -6,7 +6,7 @@ from mesh_pose.registration_inputs import make_crop_data_batch
 
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("rgb_max", [1, 255])
-def test_network_crops_match_pinned_adapter(normalize, rgb_max):
+def test_network_crops_match_pinned_adapter(normalize, rgb_max, monkeypatch):
     from spatialhub.models.foundationpose.adapter import make_crop_data_batch as reference
 
     rng = np.random.default_rng(13)
@@ -24,6 +24,23 @@ def test_network_crops_match_pinned_adapter(normalize, rgb_max):
                   depth=xyz[:, :, 2], intrinsics=np.float32([[30, 0, 16], [0, 30, 12], [0, 0, 1]]),
                   crop_ratio=1.2, xyz_map=xyz, model_diameter=0.25, normalize_xyz=normalize,
                   renderer=Renderer())
+    def render_inputs(renderer, poses, K, image_shape, boxes, size, diameter, normalized):
+        from mesh_pose import _atlas
+
+        color, _, _, coords = renderer.render()
+        def tiled(values):
+            atlas = np.zeros((20, 24, 4), np.float32)
+            for i, tile in enumerate(values):
+                row, col = divmod(i, 2)
+                roi = atlas[row*10:(row+1)*10, col*12:(col+1)*12]
+                roi[:, :, :3] = tile[::-1]
+                roi[:, :, 3] = 1
+            return atlas
+
+        buf = _atlas.pack(tiled(color), tiled(coords), poses, 3, 2, 10, 12, normalized, diameter / 2)
+        return np.frombuffer(buf, np.float32).reshape(3, 6, 10, 12)
+
+    monkeypatch.setattr("mesh_pose.registration_inputs.render_inputs", render_inputs)
     for packed, original in zip(make_crop_data_batch(**inputs), reference(**inputs)):
         assert packed.flags.c_contiguous
         assert packed.dtype == original.dtype == np.float32

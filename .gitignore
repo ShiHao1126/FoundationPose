@@ -8,3 +8,7 @@ runs/
 
 
 configs/realsense.json
+
+build/
+*.pyd
+*.so

@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 
+from .registration_atlas import render_inputs
+
 
 def _pack(rgb, xyz, centers, diameter, normalize_xyz):
     """Pack NHWC crops directly into the float32 NCHW layout consumed by ONNX."""
@@ -28,11 +30,13 @@ def make_crop_data_batch(*, render_size, ob_in_cams, rgb, depth, intrinsics, cro
     transforms, boxes = compute_crop_window_tf_batch(
         H=height, W=width, poses=ob_in_cams, intrinsics=intrinsics, crop_ratio=crop_ratio,
         out_size=render_size, model_diameter=model_diameter)
-    colors, _, _, coords = renderer.render(
-        intrinsics=intrinsics, H=height, W=width, ob_in_cams=ob_in_cams,
-        output_size=render_size, bbox2d=boxes, use_light=True)
+    synthetic = render_inputs(renderer, ob_in_cams, intrinsics, depth.shape, boxes, render_size,
+                              model_diameter, normalize_xyz)
     centers = np.asarray(ob_in_cams[:, :3, 3, None, None], dtype=np.float32)
-    synthetic = _pack(colors * 255.0, coords, centers, model_diameter, normalize_xyz)
+    shared = np.all(centers == centers[:1]) and np.all(transforms == transforms[:1])
+    if shared:
+        transforms = transforms[:1]
+        centers = centers[:1]
 
     def warp(image, interpolation):
         crops = np.empty((len(transforms), render_size[1], render_size[0], 3), dtype=np.float32)
@@ -42,4 +46,6 @@ def make_crop_data_batch(*, render_size, ob_in_cams, rgb, depth, intrinsics, cro
 
     observed = _pack(warp(rgb, cv2.INTER_LINEAR), warp(xyz_map, cv2.INTER_NEAREST),
                      centers, model_diameter, normalize_xyz)
+    if shared:
+        observed = np.broadcast_to(observed, synthetic.shape)
     return synthetic, observed
