@@ -28,7 +28,7 @@ def relocalize_seed(estimator, frame, mask, seed, max_rotation_deg, iterations):
 
 
 def register_steps(estimator, frame, mask, iterations, grid=None):
-    from spatialhub.models.foundationpose.adapter import make_crop_data_batch
+    from .registration_inputs import make_crop_data_batch
     from spatialhub.models.foundationpose.helper import (
         egocentric_delta_pose_to_pose, guess_translation, rotvec_to_rotmat_np)
     from spatialhub.utils import unproject_depth_map
