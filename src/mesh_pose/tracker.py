@@ -10,6 +10,8 @@ import numpy as np
 from .contracts import Config, PoseBackend, Quality, RGBDFrame, TrackingResult
 from .geometry import pose_difference
 from .pose_matching import PoseMatcher
+from .frame_history import FrameHistory
+from .pose_transport import transport_pose
 
 
 class Phase(Enum):
@@ -22,7 +24,9 @@ class Phase(Enum):
 
 
 class Tracker:
-    def __init__(self, backend: PoseBackend, config: Config):
+    def __init__(self, backend: PoseBackend, config: Config, history: FrameHistory | None = None):
+        self._history = history
+        self._registration_frame = None
         self.backend = backend
         self.config = config
         self.matcher = PoseMatcher(backend, config)
@@ -47,6 +51,7 @@ class Tracker:
         return self._phase.value
 
     def _cancel_search(self) -> None:
+        self._registration_frame = None
         if self._search_steps is not None:
             self._search_steps.close()
             self._search_steps = None
@@ -149,6 +154,7 @@ class Tracker:
             return reason, quality, self._search_source
 
     def _global_search(self, frame: RGBDFrame, cooperative: bool):
+        self._registration_frame = frame if self._history is not None else None
         candidates = self.backend.detect(frame)
         if self._last_good_pose is not None and candidates:
             self._mask_probe_time = frame.timestamp_s
@@ -250,6 +256,15 @@ class Tracker:
                 pose, quality = match
                 self._begin_recovery(pose)
                 return "confirming_refreshed_initialization", quality
+        if self._phase is Phase.ALIGNING and self._registration_frame is not None:
+            source = self._registration_frame
+            self._registration_frame = None
+            observations = self._history.between(source, frame)
+            match = transport_pose(self.matcher, source, observations, self._pose)
+            if match is not None:
+                pose, quality = match
+                self._begin_recovery(pose)
+                return "confirming_flow_transport", quality
         self._lose()
         return quality.reason, quality
 

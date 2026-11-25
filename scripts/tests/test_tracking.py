@@ -758,3 +758,26 @@ def test_live_rotation_retry_requires_one_local_region_and_fresh_confirmation(co
         assert result.state == "CONFIRMING" and len(calls) == 1
         backend.track = lambda _, initial: initial.copy()
         assert tracker.step(frame(3), cooperative=True).state == "TRACKING"
+
+def test_transported_seed_requires_a_new_exposure(config, monkeypatch):
+    from mesh_pose.frame_history import FrameHistory
+    from mesh_pose.contracts import Quality
+
+    history = FrameHistory()
+    tracker = Tracker(Backend(), config, history=history)
+    for i in range(10):
+        history.append(frame(i))
+    first = tracker.step(frame(0))
+    assert first.state == "CONFIRMING"
+    with monkeypatch.context() as patch:
+        patch.setattr(tracker.matcher, "mask_quality", lambda *a, **kw: None)
+        patch.setattr(tracker.matcher, "refresh_initialization", lambda *a, **kw: None)
+        def transported(matcher, source, observations, seed):
+            assert source.sequence == 0
+            assert [f.sequence for f in observations] == [3, 6, 8]
+            return seed.copy(), Quality(True, "ok")
+        patch.setattr("mesh_pose.tracker.transport_pose", transported)
+        result = tracker.step(frame(8))
+    assert result.reason == "confirming_flow_transport"
+    assert result.T_camera_object is None
+    assert tracker.step(frame(9)).state == "TRACKING"

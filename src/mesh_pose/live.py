@@ -17,6 +17,7 @@ import cv2
 from .contracts import RGBDFrame, TrackingResult
 from .sequence import RunWriter
 from .tracker import Tracker
+from .frame_history import FrameHistory
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class LiveSession:
         self._inference_skipped = 0
         self._inference_stats = {}
         self._threads = []
+        self._history = FrameHistory()
 
     def start(self) -> None:
         if self._threads:
@@ -105,6 +107,7 @@ class LiveSession:
                     if first is None:
                         first = (frame.sequence, frame.timestamp_s, received)
                     item = ReceivedFrame(frame, received, self.source.last_frame_metadata.copy(), count)
+                    self._history.append(frame)
                     with self._condition:
                         self._latest = item  # One slot: no inference backlog.
                         sensor_span = frame.timestamp_s - first[1]
@@ -138,7 +141,7 @@ class LiveSession:
             with self._condition:
                 self._phase = "loading GPU models and CAD templates"
             backend = self.backend_factory(item.frame.K)
-            tracker = Tracker(backend, self.config)
+            tracker = Tracker(backend, self.config, history=self._history)
             with self._condition:
                 self._bounds = backend.object_bounds_m.copy()
             (self.writer.directory / "camera.json").write_text(json.dumps(
@@ -212,6 +215,7 @@ class LiveSession:
             thread.join(max(0, deadline - monotonic()))
         if not self.finished and self._threads:
             raise TimeoutError("Workers still stopping; do not start a second camera session")
+        self._history.clear()
         if self._error is None:
             self.writer.mark_complete()
         self.writer.close()

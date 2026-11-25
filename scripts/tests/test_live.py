@@ -126,3 +126,16 @@ def test_preview_denoise_preserves_input_and_silhouette():
     assert np.array_equal(preview_rgb(rgb, lut, False), lut[original])
     assert smoothed[10, 10, 0] < lut[27]
     assert np.array_equal(smoothed[20, 29:31], lut[original[20, 29:31]])
+
+def test_capture_history_is_sampled_causal_and_rejects_gaps():
+    from mesh_pose.frame_history import FrameHistory
+
+    history = FrameHistory()
+    for i in range(25):
+        history.append(frame(i))
+    samples = history.between(frame(1), frame(11))
+    assert [sample.sequence for sample in samples] == [3, 6, 9, 11]
+    history.append(frame(35))
+    assert history.between(frame(15), frame(36)) == ()
+    history.clear()
+    assert history.between(frame(1), frame(11)) == ()
